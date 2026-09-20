@@ -1,0 +1,24 @@
+schema_version = 1
+
+[sam]
+model_id = "mlx-community/sam3.1-bf16"
+revision = "a992e302ea9b0f03f41dfd93414a4fd0e818f65b"
+filename = "model.safetensors"
+sha256 = "a1b1c19dcc9bdd68438bcd74433fadc90740e73c37a1f386872672d134879c42"
+license_url = "https://github.com/facebookresearch/sam3/blob/main/LICENSE"
+
+[pmpose]
+repository = "https://github.com/MiraPurkrabek/BBoxMaskPose.git"
+revision = "49a070a6f8396147323b1c4959474077dbe2ce8e"
+filename = "PMPose-b-1.0.0-inference.pth"
+url = "https://huggingface.co/vrg-prague/BBoxMaskPose/resolve/main/PMPose/PMPose-b-1.0.0-inference.pth"
+sha256 = "85c438b6598557803b5eb4c1882b6c78d28e91e52821dd4ce9640d2a9dab0592"
+license_url = "https://github.com/MiraPurkrabek/BBoxMaskPose/blob/main/LICENSE"
+
+[cotracker]
+repository = "https://github.com/facebookresearch/co-tracker.git"
+revision = "82e02e8029753ad4ef13cf06be7f4fc5facdda4d"
+filename = "scaled_offline.pth"
+url = "https://huggingface.co/facebook/cotracker3/resolve/main/scaled_offline.pth"
+sha256 = "2670d4562ed69326dda775a26e54883925cd11b6fc9b24cb7aa9f8078bce7834"
+license_url = "https://github.com/facebookresearch/co-tracker/blob/main/LICENSE.md"

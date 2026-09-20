@@ -1,0 +1,8 @@
+diff --git a/mmpose/models/heads/__init__.py b/mmpose/models/heads/__init__.py
+index 9f267dc..6b3fb1c 100644
+--- a/mmpose/models/heads/__init__.py
++++ b/mmpose/models/heads/__init__.py
+@@ -15 +14,0 @@ from .regression_heads import (
+-from .transformer_heads import EDPoseHead
+@@ -36 +34,0 @@ __all__ = [
+-    "EDPoseHead",

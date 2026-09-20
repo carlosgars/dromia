@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+title: DromIA
+message: Please cite the DromIA paper and the upstream models listed in THIRD_PARTY_NOTICES.md.
+type: software
+version: 0.1.0
+authors:
+  - family-names: Garsancho
+    given-names: Carlos
