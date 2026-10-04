@@ -3,6 +3,7 @@ title: DromIA
 message: Please cite the DromIA paper and the upstream models listed in THIRD_PARTY_NOTICES.md.
 type: software
 version: 0.1.0
+repository-code: https://github.com/carlosgars/dromia
 authors:
   - family-names: Garsancho
     given-names: Carlos

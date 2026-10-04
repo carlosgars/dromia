@@ -47,12 +47,7 @@ class PoseConfig(FrozenModel):
     exact_pmpose_heatmap_registration: bool = True
 
 
-class PosteriorConfig(FrozenModel):
-    decode_method: Literal["map"] = "map"
-
-
 class ShoeTrackAssignmentConfig(FrozenModel):
-    enabled: Literal[True] = True
     runner_min_overlap_margin: float = 0.02
     runner_min_supporting_frames: int = 3
     side_min_distance_margin_norm: float = 0.01
@@ -60,7 +55,6 @@ class ShoeTrackAssignmentConfig(FrozenModel):
 
 
 class ShoeRefinementConfig(FrozenModel):
-    enabled: Literal[True] = True
     compatibility_strength: float = 0.65
     sigma_bbox_height_fraction: float = 0.04
     min_peak_ratio_for_relocation: float = 5.0
@@ -72,7 +66,6 @@ class CalibrationConfig(FrozenModel):
 
 
 class AutoPoseRepairConfig(FrozenModel):
-    enabled: Literal[True] = True
     joint_ids: tuple[int, ...] = (5, 6, 11, 12, 13, 14, 15, 16)
     per_joint_trigger_ids: tuple[int, ...] = (13, 14, 15, 16)
     mixed_pose_core_joint_ids: tuple[int, ...] = (5, 6, 11, 12)
@@ -81,7 +74,6 @@ class AutoPoseRepairConfig(FrozenModel):
     bbox_padding_height_fraction: float = 0.05
     severe_jump_threshold_norm: float = 0.08
     weak_jump_threshold_norm: float = 0.05
-    final_step_cap_enabled: Literal[True] = True
     final_max_step_norm: float = 0.08
     bilateral_collapse_max_separation_norm: float = 0.025
     bilateral_neighbor_min_separation_norm: float = 0.08
@@ -89,11 +81,8 @@ class AutoPoseRepairConfig(FrozenModel):
     stable_anchor_frames: int = 3
     bilateral_anchor_assignment_margin_norm: float = 0.03
     stable_quality_median_fraction: float = 0.75
-    limb_length_enabled: Literal[False] = False
-    limb_relative_deviation: float = 0.35
     heatmap_alignment_threshold_px: float = 24.0
     boundary_frames: int = 8
-    tracker_enabled: Literal[True] = True
     tracker_device: str = "auto"
     tracker_input_max_width: int = 640
     tracker_visibility_threshold: float = 0.5
@@ -108,7 +97,6 @@ class AutoPoseRepairConfig(FrozenModel):
 class CoTrackerConfig(FrozenModel):
     """Pinned local-window tracker settings for expert correction propagation."""
 
-    enabled: Literal[True] = True
     model_name: str = "cotracker3_offline"
     repository: str = "facebookresearch/co-tracker:82e02e8029753ad4ef13cf06be7f4fc5facdda4d"
     device: str = "mps"
@@ -118,7 +106,6 @@ class CoTrackerConfig(FrozenModel):
 
 
 class TemporalBiomechanicsConfig(FrozenModel):
-    enabled: Literal[True] = True
     position_step_sigma_norm: float = 0.035
     angle_step_sigma_degrees: float = 22.0
     bend_step_sigma: float = 0.28
@@ -139,13 +126,11 @@ class TemporalBiomechanicsConfig(FrozenModel):
 
 
 class GaitAnalysisConfig(FrozenModel):
-    enabled: Literal[True] = True
     fps_override: float | None = Field(default=None, gt=0.0)
     capture_fps_override: float | None = Field(default=None, gt=0.0)
     cadence_min_spm: float = 100.0
     cadence_max_spm: float = 260.0
     ground_percentile: float = 94.0
-    ground_model: Literal["per_shoe_line"] = "per_shoe_line"
     ground_line_candidate_quantile: float = 94.0
     ground_line_bin_count: int = 12
     ground_line_min_candidates_per_bin: int = 8
@@ -198,7 +183,6 @@ class DromiaConfig(FrozenModel):
     sam: SamConfig = Field(default_factory=SamConfig)
     runners: RunnerFilterConfig = Field(default_factory=RunnerFilterConfig)
     pose: PoseConfig = Field(default_factory=PoseConfig)
-    posterior: PosteriorConfig = Field(default_factory=PosteriorConfig)
     shoe_track_assignment: ShoeTrackAssignmentConfig = Field(
         default_factory=ShoeTrackAssignmentConfig
     )

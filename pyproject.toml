@@ -41,6 +41,10 @@ dev = ["pytest>=8,<9", "ruff>=0.15,<1"]
 [project.scripts]
 dromia = "dromia.cli:main"
 
+[project.urls]
+Repository = "https://github.com/carlosgars/dromia"
+Issues = "https://github.com/carlosgars/dromia/issues"
+
 [build-system]
 requires = ["hatchling>=1.29"]
 build-backend = "hatchling.build"
@@ -57,7 +61,10 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = ["E", "F", "I", "UP", "B", "C90"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 20
 
 [tool.uv.extra-build-dependencies]
 chumpy = ["pip", "setuptools"]

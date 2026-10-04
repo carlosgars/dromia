@@ -10,20 +10,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-import cv2
 from pydantic import BaseModel, Field
 
-from dromia import calibration as dromia_calibration
 from dromia import config as dromia_config
-from dromia import dto as dromia_dto
 from dromia import temporal_calibration as dromia_temporal_calibration
 from dromia import timebase as dromia_timebase
 from dromia.pipeline import runner as dromia_pipeline
 from dromia.review import cvat as cvat_annotation
-
-
-class AnalysisCancelled(RuntimeError):
-    pass
 
 
 class AnalysisRecord(BaseModel):
@@ -32,7 +25,7 @@ class AnalysisRecord(BaseModel):
     name: str
     view_name: str
     input_video: str
-    status: Literal["ready", "queued", "running", "complete", "failed", "cancelled"] = "queued"
+    status: Literal["ready", "queued", "running", "complete", "failed"] = "queued"
     stage: str = "queued"
     progress: float = Field(default=0.0, ge=0.0, le=1.0)
     source_fps: float | None = Field(default=None, gt=0)
@@ -47,23 +40,11 @@ class AnalysisRecord(BaseModel):
     real_world_duration_s: float | None = Field(default=None, gt=0)
     quicktime_full_frame_rate_playback_intent: bool | None = None
     preset: str = dromia_config.DEFAULT_POSE_VARIANT
-    calibration_path: str | None = None
     run_dir: str | None = None
     cvat_project_id: int | None = None
     error: str | None = None
-    cancel_requested: bool = False
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
-
-
-class ExistingRun(BaseModel):
-    run_name: str
-    video_name: str
-    frame_count: int
-    runner_ids: list[int]
-    cvat_project_id: int | None = None
-    calibrated: bool = False
-    analysis_id: str | None = None
 
 
 class AnalysisManager:
@@ -143,122 +124,6 @@ class AnalysisManager:
             self.pending.put(analysis_id)
         return record
 
-    def list_existing_runs(self) -> list[ExistingRun]:
-        """List completed pipeline runs whose source video is still locally available."""
-
-        analyses_by_run = {
-            str(Path(record.run_dir).resolve()): record.analysis_id
-            for record in self.list()
-            if record.run_dir is not None and record.status == "complete"
-        }
-        result: list[ExistingRun] = []
-        for manifest_path in self.runs_dir.glob("*/manifest.json"):
-            try:
-                run = manifest_path.parent.resolve()
-                manifest = dromia_dto.RunManifest.model_validate_json(manifest_path.read_text())
-                video = (run / manifest.source_video.path).resolve()
-                if not video.is_file():
-                    continue
-                registry_path = run / "annotations" / "cvat" / "tasks.json"
-                if not registry_path.is_file():
-                    continue
-                project_id = cvat_annotation.CvatTaskRegistry.model_validate_json(
-                    registry_path.read_text()
-                ).project_id
-                result.append(
-                    ExistingRun(
-                        run_name=run.name,
-                        video_name=video.name,
-                        frame_count=manifest.frame_count,
-                        runner_ids=manifest.accepted_runner_ids,
-                        cvat_project_id=project_id,
-                        calibrated=(run / "calibration" / "ground_calibration.json").is_file(),
-                        analysis_id=analyses_by_run.get(str(run)),
-                    )
-                )
-            except (OSError, ValueError):
-                continue
-        return sorted(result, key=lambda item: item.run_name, reverse=True)
-
-    def attach_existing_run(self, run_name: str) -> AnalysisRecord:
-        """Expose a synchronized run in the analysis UI without copying or reprocessing it."""
-
-        if not run_name or Path(run_name).name != run_name:
-            raise ValueError("Invalid DromIA run selection")
-        run = (self.runs_dir / run_name).resolve()
-        if run.parent != self.runs_dir:
-            raise ValueError("Invalid DromIA run selection")
-        manifest_path = run / "manifest.json"
-        if not manifest_path.is_file():
-            raise FileNotFoundError(f"DromIA run has no manifest: {run_name}")
-        manifest = dromia_dto.RunManifest.model_validate_json(manifest_path.read_text())
-        video = (run / manifest.source_video.path).resolve()
-        if not video.is_file():
-            raise FileNotFoundError(f"Source video is not available: {video.name}")
-
-        with self.state_lock:
-            for existing in self.list():
-                if (
-                    existing.status == "complete"
-                    and existing.run_dir is not None
-                    and Path(existing.run_dir).resolve() == run
-                ):
-                    return existing
-
-            capture = cv2.VideoCapture(str(video))
-            try:
-                fps = float(capture.get(cv2.CAP_PROP_FPS))
-                decoded_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-            finally:
-                capture.release()
-            frame_count = manifest.frame_count or decoded_count
-            fps_value = fps if fps > 0 else None
-            registry_path = run / "annotations" / "cvat" / "tasks.json"
-            if not registry_path.is_file():
-                raise FileNotFoundError(f"DromIA run is not synchronized with CVAT: {run_name}")
-            project_id = cvat_annotation.CvatTaskRegistry.model_validate_json(
-                registry_path.read_text()
-            ).project_id
-            calibration_path = run / "calibration" / "ground_calibration.json"
-            timebase_path = run / "timebase.json"
-            persisted_timing = (
-                dromia_timebase.VideoTimebase.model_validate_json(timebase_path.read_text())
-                if timebase_path.is_file()
-                else None
-            )
-            capture_fps = None if persisted_timing is None else persisted_timing.real_world_fps
-            record = AnalysisRecord(
-                analysis_id=uuid.uuid4().hex,
-                name=video.stem,
-                view_name="sagittal",
-                input_video=str(video),
-                status="complete",
-                stage="complete",
-                progress=1.0,
-                source_fps=fps_value,
-                source_frame_count=frame_count,
-                source_duration_s=(frame_count / fps_value if fps_value else None),
-                capture_fps=capture_fps,
-                capture_fps_reviewed=capture_fps is not None,
-                real_world_duration_s=(
-                    frame_count / capture_fps if capture_fps is not None else None
-                ),
-                quicktime_full_frame_rate_playback_intent=(
-                    None
-                    if persisted_timing is None
-                    else persisted_timing.quicktime_full_frame_rate_playback_intent
-                ),
-                calibration_path=str(calibration_path) if calibration_path.is_file() else None,
-                run_dir=str(run),
-                cvat_project_id=project_id,
-            )
-            self.save(record)
-            try:
-                self.estimate_capture_fps(record.analysis_id)
-                return self.get(record.analysis_id)
-            except (OSError, ValueError):
-                return record
-
     def start(self, analysis_id: str, *, capture_fps: float | None = None) -> AnalysisRecord:
         with self.state_lock:
             record = self.get(analysis_id)
@@ -315,41 +180,6 @@ class AnalysisManager:
                 json.dumps(record.model_dump(mode="json"), indent=2), encoding="utf-8"
             )
             temporary.replace(path)
-
-    def retry(self, analysis_id: str) -> AnalysisRecord:
-        with self.state_lock:
-            record = self.get(analysis_id)
-            if record.status not in {"failed", "cancelled"}:
-                raise ValueError("Only failed or cancelled analyses can be retried")
-            record.status = "queued"
-            record.stage = "queued"
-            record.progress = 0.0
-            record.error = None
-            record.cancel_requested = False
-            self.save(record)
-        self.pending.put(analysis_id)
-        return record
-
-    def cancel(self, analysis_id: str) -> AnalysisRecord:
-        with self.state_lock:
-            record = self.get(analysis_id)
-            if record.status in {"complete", "failed", "cancelled"}:
-                return record
-            record.cancel_requested = True
-            if record.status in {"ready", "queued"}:
-                record.status = "cancelled"
-                record.stage = "cancelled"
-            self.save(record)
-            return record
-
-    def attach_calibration(self, analysis_id: str, calibration_path: Path) -> AnalysisRecord:
-        with self.state_lock:
-            record = self.get(analysis_id)
-            if record.status not in {"ready", "complete"}:
-                raise ValueError("Calibration is available before start or after completion")
-            record.calibration_path = str(calibration_path.resolve())
-            self.save(record)
-            return record
 
     def recalibrate_timing(self, analysis_id: str, capture_fps: float) -> AnalysisRecord:
         with self.state_lock:
@@ -437,8 +267,6 @@ class AnalysisManager:
     def run_one(self, analysis_id: str) -> AnalysisRecord:
         with self.lock:
             record = self.get(analysis_id)
-            if record.status == "cancelled":
-                return record
             record.status = "running"
             record.stage = "starting"
             self.save(record)
@@ -458,17 +286,9 @@ class AnalysisManager:
                     ).resolve()
                 )
                 self.save(record)
-            if record.calibration_path is not None:
-                calibration = dromia_calibration.GroundCalibration.model_validate_json(
-                    Path(record.calibration_path).read_text()
-                )
-                dromia_calibration.save_ground_calibration(Path(record.run_dir), calibration)
-
             def progress(stage: str, fraction: float) -> None:
                 with self.state_lock:
                     current = self.get(analysis_id)
-                    if current.cancel_requested:
-                        raise AnalysisCancelled("Analysis cancelled by user")
                     current.stage = stage
                     current.progress = fraction
                     self.save(current)
@@ -502,10 +322,6 @@ class AnalysisManager:
                 record.status = "complete"
                 record.stage = "complete"
                 record.progress = 1.0
-            except AnalysisCancelled:
-                record = self.get(analysis_id)
-                record.status = "cancelled"
-                record.stage = "cancelled"
             except Exception as exc:
                 record = self.get(analysis_id)
                 record.status = "failed"

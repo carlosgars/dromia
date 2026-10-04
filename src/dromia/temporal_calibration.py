@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import re
@@ -32,41 +31,10 @@ def estimate_capture_fps(
 
     video = video_path.expanduser().resolve()
     intent = dromia_timebase.quicktime_full_frame_rate_playback_intent(video)
-    filename_match = re.search(
-        r"(?:hsr|hfr|slowmo|slow[_ -]?motion|fps)[_ -]?(\d{2,3})|"
-        r"(\d{2,3})[_ -]?(?:fps|hz)",
-        video.stem,
-        flags=re.IGNORECASE,
+    filename_fps = capture_fps_from_name(video.stem)
+    intent, persisted_capture_fps, media_cadences = load_capture_evidence(
+        run_dir, intent, current_capture_fps
     )
-    filename_fps = (
-        float(next(value for value in filename_match.groups() if value))
-        if filename_match is not None
-        else None
-    )
-    timing = None
-    persisted_capture_fps = current_capture_fps
-    media_cadences: list[float] = []
-    if run_dir is not None:
-        run = run_dir.expanduser().resolve()
-        timebase_path = run / "timebase.json"
-        if timebase_path.is_file():
-            timing = dromia_timebase.VideoTimebase.model_validate_json(timebase_path.read_text())
-            if timing.temporal_calibration_source != "media_timeline_assumed_real_time":
-                persisted_capture_fps = timing.real_world_fps
-            intent = (
-                timing.quicktime_full_frame_rate_playback_intent
-                if timing.quicktime_full_frame_rate_playback_intent is not None
-                else intent
-            )
-        gait_path = run / "gait" / "gait_analysis.json"
-        if gait_path.is_file():
-            payload = json.loads(gait_path.read_text())
-            current_scale = float(timing.media_to_real_time_scale) if timing is not None else 1.0
-            for runner in payload.get("runners", {}).values():
-                cadence = runner.get("cadence", {})
-                value = cadence.get("unfiltered_cadence_spm", cadence.get("cadence_spm"))
-                if value is not None and math.isfinite(float(value)):
-                    media_cadences.append(float(value) * current_scale)
 
     candidates = {value for value in STANDARD_CAPTURE_FPS if value >= playback_fps * 0.95}
     candidates.add(float(playback_fps))
@@ -74,46 +42,15 @@ def estimate_capture_fps(
         candidates.add(filename_fps)
     if persisted_capture_fps is not None:
         candidates.add(float(persisted_capture_fps))
-    scored = []
     usable = [value for value in media_cadences if 5.0 <= value <= 300.0]
-    for capture_fps in sorted(candidates):
-        corrected = [value * capture_fps / playback_fps for value in usable]
-        evidence_scores = [
-            math.exp(-0.5 * ((value - 175.0) / 25.0) ** 2) if 100.0 <= value <= 260.0 else 0.0
-            for value in corrected
-        ]
-        support = sum(score >= 0.25 for score in evidence_scores)
-        score = sum(sorted(evidence_scores, reverse=True)[:6])
-        if intent is False and capture_fps <= playback_fps * 1.05:
-            score *= 0.1
-        if intent is True and abs(capture_fps - playback_fps) < 0.01:
-            score += 2.0
-        elif intent is not False and abs(capture_fps - playback_fps) < 0.01:
-            score += 0.5
-        if filename_fps is not None and abs(capture_fps - filename_fps) < 0.01:
-            score += 3.0
-        if persisted_capture_fps is not None and abs(capture_fps - persisted_capture_fps) < 0.01:
-            score += 4.0
-        scored.append(
-            {
-                "capture_fps": capture_fps,
-                "score": score,
-                "supporting_runner_count": support,
-                "corrected_cadence_median_spm": (
-                    float(
-                        np.median(
-                            [
-                                value
-                                for value, score in zip(corrected, evidence_scores, strict=True)
-                                if score >= 0.25
-                            ]
-                        )
-                    )
-                    if support
-                    else None
-                ),
-            }
-        )
+    scored = score_capture_candidates(
+        candidates,
+        playback_fps=playback_fps,
+        usable_cadences=usable,
+        intent=intent,
+        filename_fps=filename_fps,
+        persisted_capture_fps=persisted_capture_fps,
+    )
     scored.sort(key=lambda item: (item["score"], item["capture_fps"]), reverse=True)
     best = scored[0]
     second_score = scored[1]["score"] if len(scored) > 1 else 0.0
@@ -162,6 +99,92 @@ def estimate_capture_fps(
         "evidence": evidence,
         "candidates": scored[:4],
     }
+
+
+def capture_fps_from_name(stem: str) -> float | None:
+    match = re.search(
+        r"(?:hsr|hfr|slowmo|slow[_ -]?motion|fps)[_ -]?(\d{2,3})|"
+        r"(\d{2,3})[_ -]?(?:fps|hz)",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    return float(next(value for value in match.groups() if value)) if match else None
+
+
+def load_capture_evidence(
+    run_dir: Path | None,
+    intent: bool | None,
+    current_capture_fps: float | None,
+) -> tuple[bool | None, float | None, list[float]]:
+    if run_dir is None:
+        return intent, current_capture_fps, []
+    run = run_dir.expanduser().resolve()
+    timing = None
+    persisted = current_capture_fps
+    timebase_path = run / "timebase.json"
+    if timebase_path.is_file():
+        timing = dromia_timebase.VideoTimebase.model_validate_json(timebase_path.read_text())
+        if timing.temporal_calibration_source != "media_timeline_assumed_real_time":
+            persisted = timing.real_world_fps
+        if timing.quicktime_full_frame_rate_playback_intent is not None:
+            intent = timing.quicktime_full_frame_rate_playback_intent
+    cadences: list[float] = []
+    gait_path = run / "gait" / "gait_analysis.json"
+    if gait_path.is_file():
+        payload = json.loads(gait_path.read_text())
+        scale = float(timing.media_to_real_time_scale) if timing is not None else 1.0
+        for runner in payload.get("runners", {}).values():
+            cadence = runner.get("cadence", {})
+            value = cadence.get("unfiltered_cadence_spm", cadence.get("cadence_spm"))
+            if value is not None and math.isfinite(float(value)):
+                cadences.append(float(value) * scale)
+    return intent, persisted, cadences
+
+
+def score_capture_candidates(
+    candidates: set[float],
+    *,
+    playback_fps: float,
+    usable_cadences: list[float],
+    intent: bool | None,
+    filename_fps: float | None,
+    persisted_capture_fps: float | None,
+) -> list[dict[str, Any]]:
+    scored: list[dict[str, Any]] = []
+    for capture_fps in sorted(candidates):
+        corrected = [value * capture_fps / playback_fps for value in usable_cadences]
+        evidence_scores = [
+            math.exp(-0.5 * ((value - 175.0) / 25.0) ** 2) if 100.0 <= value <= 260.0 else 0.0
+            for value in corrected
+        ]
+        support = sum(score >= 0.25 for score in evidence_scores)
+        score = sum(sorted(evidence_scores, reverse=True)[:6])
+        if intent is False and capture_fps <= playback_fps * 1.05:
+            score *= 0.1
+        if intent is True and abs(capture_fps - playback_fps) < 0.01:
+            score += 2.0
+        elif intent is not False and abs(capture_fps - playback_fps) < 0.01:
+            score += 0.5
+        if filename_fps is not None and abs(capture_fps - filename_fps) < 0.01:
+            score += 3.0
+        if persisted_capture_fps is not None and abs(capture_fps - persisted_capture_fps) < 0.01:
+            score += 4.0
+        supported = [
+            value
+            for value, evidence in zip(corrected, evidence_scores, strict=True)
+            if evidence >= 0.25
+        ]
+        scored.append(
+            {
+                "capture_fps": capture_fps,
+                "score": score,
+                "supporting_runner_count": support,
+                "corrected_cadence_median_spm": (
+                    float(np.median(supported)) if supported else None
+                ),
+            }
+        )
+    return scored
 
 
 def calibrate_timebase(
@@ -221,7 +244,11 @@ def recalibrate_gait_payload(
 ) -> dict[str, Any]:
     """Recompute only timestamp-derived values from existing frames and events."""
 
-    gait_analysis.migrate_metric_fields(payload)
+    if payload.get("schema_version") != gait_contract.SCHEMA_VERSION:
+        raise ValueError(
+            "Temporal recalibration requires a current DromIA gait artifact; "
+            "legacy schema migration is intentionally unsupported"
+        )
     for runner in payload.get("runners", {}).values():
         runner["source_fps"] = float(timing.source_fps)
         runner["real_world_fps"] = float(timing.real_world_fps or timing.source_fps)
@@ -329,23 +356,3 @@ def recalibrate_run(run_dir: Path, capture_fps: float, *, backup: bool = True) -
         "backup_dir": None if backup_dir is None else str(backup_dir),
         "artifacts": outputs,
     }
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Recalibrate completed DromIA time metrics without rerunning inference"
-    )
-    parser.add_argument("run_dir", type=Path)
-    parser.add_argument("--capture-fps", type=float, required=True)
-    parser.add_argument("--no-backup", action="store_true")
-    args = parser.parse_args()
-    print(
-        json.dumps(
-            recalibrate_run(args.run_dir, args.capture_fps, backup=not args.no_backup), indent=2
-        )
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

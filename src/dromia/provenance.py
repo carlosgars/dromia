@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from dromia import artifacts
 from dromia import config as dromia_config
 
 COTRACKER_CHECKPOINT_SHA256 = "2670d4562ed69326dda775a26e54883925cd11b6fc9b24cb7aa9f8078bce7834"
@@ -62,7 +63,7 @@ def build_run_provenance(
 
 def save_run_provenance(run_dir: Path, payload: dict[str, Any]) -> Path:
     path = run_dir / "provenance.json"
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    artifacts.atomic_write_json(path, payload)
     return path
 
 
@@ -104,8 +105,4 @@ def git_dirty(repo_root: Path) -> bool | None:
 
 
 def file_sha256(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(chunk_size):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return artifacts.file_sha256(path, chunk_size)

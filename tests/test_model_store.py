@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+from dromia import cli
 from dromia.models import store
 
 
@@ -57,3 +58,15 @@ revision = "cotracker-revision"
     assert report["checks"]["sam"]["valid"] is False
     assert report["checks"]["pmpose"]["present"] is False
     assert report["checks"]["cotracker"]["present"] is False
+
+
+def test_model_verification_failure_has_no_traceback(monkeypatch, capsys):
+    def fail_verification():
+        raise RuntimeError("missing")
+
+    monkeypatch.setattr(store, "verify", fail_verification)
+
+    assert cli.main(["models", "verify"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "missing\n"

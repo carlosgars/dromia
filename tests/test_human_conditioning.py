@@ -171,6 +171,26 @@ def test_contralateral_exclusion_penalizes_duplicate_ankle_location() -> None:
     assert support[16, 14] > 0.8
 
 
+def test_posterior_file_is_loaded_once_for_multiple_joints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_posterior_maps(tmp_path, frame_count=1, runner_id=3, peak_xy=(10, 16))
+    original_load = np.load
+    load_count = 0
+
+    def counting_load(*args: object, **kwargs: object) -> object:
+        nonlocal load_count
+        load_count += 1
+        return original_load(*args, **kwargs)
+
+    human_conditioning.load_posterior_file.cache_clear()
+    monkeypatch.setattr(np, "load", counting_load)
+
+    assert human_conditioning.load_posterior_map(tmp_path, 0, 3, 11) is not None
+    assert human_conditioning.load_posterior_map(tmp_path, 0, 3, 12) is not None
+    assert load_count == 1
+
+
 def test_ground_truth_identity_detects_an_adjacent_left_right_swap(tmp_path: Path) -> None:
     bundle = make_bundle(tmp_path, frame_count=3)
     posterior = bilateral_pose(frame_count=3)

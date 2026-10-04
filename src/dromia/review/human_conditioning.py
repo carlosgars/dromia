@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
-from dromia.probability import storage as heatmap_storage
 from dromia.review import cvat as cvat_annotation
 
 EPS = 1e-8
@@ -163,8 +163,8 @@ def trusted_observations(
     cfg: HumanConditioningConfig | None = None,
 ) -> list[TrustedObservation]:
     config = cfg or HumanConditioningConfig()
-    data = np.load(bundle.preannotations_npz)
-    posterior = data["posterior_keypoints_xy"]
+    with np.load(bundle.preannotations_npz, allow_pickle=False) as data:
+        posterior = np.asarray(data["posterior_keypoints_xy"], dtype=np.float32)
     observations: list[TrustedObservation] = []
     for t, frame_idx in enumerate(bundle.frame_indices):
         for obj_idx, runner_id in enumerate(bundle.runner_ids):
@@ -660,10 +660,10 @@ def condition_pose(
     cfg: HumanConditioningConfig,
     propagation_observations: list[TrustedObservation] | None = None,
 ) -> ConditioningResult:
-    data = np.load(bundle.preannotations_npz)
-    posterior = data["posterior_keypoints_xy"].astype(np.float32)
-    peak = data["posterior_peak_probability"].astype(np.float32)
-    entropy = data["posterior_entropy"].astype(np.float32)
+    with np.load(bundle.preannotations_npz, allow_pickle=False) as data:
+        posterior = data["posterior_keypoints_xy"].astype(np.float32)
+        peak = data["posterior_peak_probability"].astype(np.float32)
+        entropy = data["posterior_entropy"].astype(np.float32)
     output = cvat_annotation.AnnotationState(
         points_xy=state.points_xy.copy(),
         visibility=state.visibility.copy(),
@@ -685,19 +685,14 @@ def condition_pose(
         observations if propagation_observations is None else propagation_observations
     )
     propagation_mode = propagation_observations is not None
-    for obj_idx, runner_id in enumerate(bundle.runner_ids):
-        for local_idx, joint_id in enumerate(cvat_annotation.JOINT_IDS):
-            for t in range(len(bundle.frame_indices)):
-                observation = obs_lookup.get((runner_id, joint_id, t))
-                if observation is None:
-                    continue
-                output.points_xy[t, obj_idx, local_idx] = observation.xy
-                output.visibility[t, obj_idx, local_idx] = max(
-                    output.visibility[t, obj_idx, local_idx], 2
-                )
-                confidence[t, obj_idx, local_idx] = 1.0
-                source[t, obj_idx, local_idx] = observation.source
-                trusted[t, obj_idx, local_idx] = True
+    apply_trusted_observations(
+        bundle=bundle,
+        observations=obs_lookup,
+        output=output,
+        confidence=confidence,
+        source=source,
+        trusted=trusted,
+    )
 
     identity = infer_identity_assignments(
         run_dir=run_dir,
@@ -933,6 +928,32 @@ def condition_pose(
         smoothed_identity_centers=identity.smoothed_centers,
         diagnostics=diagnostics,
     )
+
+
+def apply_trusted_observations(
+    *,
+    bundle: cvat_annotation.CvatBundle,
+    observations: dict[tuple[int, int, int], TrustedObservation],
+    output: cvat_annotation.AnnotationState,
+    confidence: np.ndarray,
+    source: np.ndarray,
+    trusted: np.ndarray,
+) -> None:
+    """Copy immutable expert evidence into the working lower-body pose."""
+
+    for obj_idx, runner_id in enumerate(bundle.runner_ids):
+        for local_idx, joint_id in enumerate(cvat_annotation.JOINT_IDS):
+            for time_idx in range(len(bundle.frame_indices)):
+                observation = observations.get((runner_id, joint_id, time_idx))
+                if observation is None:
+                    continue
+                output.points_xy[time_idx, obj_idx, local_idx] = observation.xy
+                output.visibility[time_idx, obj_idx, local_idx] = max(
+                    output.visibility[time_idx, obj_idx, local_idx], 2
+                )
+                confidence[time_idx, obj_idx, local_idx] = 1.0
+                source[time_idx, obj_idx, local_idx] = observation.source
+                trusted[time_idx, obj_idx, local_idx] = True
 
 
 def identity_joint_swapped(
@@ -1253,15 +1274,27 @@ def load_posterior_map(
     path = (
         run_dir / "posterior" / "posteriors" / f"frame_{frame_idx:06d}_runner_{runner_id:04d}.npz"
     )
-    if not path.exists():
+    if not path.is_file():
         return None
-    data = np.load(path)
-    probability = heatmap_storage.load_posterior_joint(data, joint_id)
-    if probability is None:
+    maps, joint_ids, crop_xyxy = load_posterior_file(path)
+    positions = np.flatnonzero(joint_ids == joint_id)
+    if not len(positions):
         return None
-    probability = np.asarray(probability, dtype=np.float32)
+    probability = maps[int(positions[0])].copy()
     probability /= max(float(probability.sum()), EPS)
-    return probability, np.asarray(data["crop_xyxy"], dtype=np.float32)
+    return probability, crop_xyxy
+
+
+@lru_cache(maxsize=64)
+def load_posterior_file(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load one immutable frame/runner posterior and close its NPZ immediately."""
+
+    with np.load(path, allow_pickle=False) as data:
+        return (
+            np.asarray(data["posterior"], dtype=np.float32),
+            np.asarray(data["joint_ids"], dtype=np.int16),
+            np.asarray(data["crop_xyxy"], dtype=np.float32),
+        )
 
 
 def transported_center(
@@ -1410,21 +1443,30 @@ def save_result(
     pose_path = run_dir / "annotations" / f"human_conditioned_pose{suffix}.npz"
     diagnostics_path = run_dir / "annotations" / f"human_conditioning_diagnostics{suffix}.json"
     manifest = cvat_annotation.load_manifest(run_dir)
-    posterior_data = np.load(Path(cvat_annotation.required_artifact(manifest, "posterior_npz")))
-    frame_lookup = {int(value): idx for idx, value in enumerate(posterior_data["frame_indices"])}
-    runner_lookup = {int(value): idx for idx, value in enumerate(posterior_data["object_ids"])}
+    with np.load(
+        cvat_annotation.required_artifact(run_dir, manifest, "posterior_npz"),
+        allow_pickle=False,
+    ) as posterior_data:
+        posterior_frames = np.asarray(posterior_data["frame_indices"], dtype=np.int32)
+        posterior_ids = np.asarray(posterior_data["object_ids"], dtype=np.int32)
+        canonical_xy = np.asarray(posterior_data["posterior_keypoints_xy"], dtype=np.float32)
+        peak_probability = np.asarray(
+            posterior_data["posterior_peak_probability"], dtype=np.float32
+        )
+        entropy = np.asarray(posterior_data["posterior_entropy"], dtype=np.float32)
+    frame_lookup = {int(value): idx for idx, value in enumerate(posterior_frames)}
+    runner_lookup = {int(value): idx for idx, value in enumerate(posterior_ids)}
     frame_selection = [frame_lookup[value] for value in bundle.frame_indices]
     runner_selection = [runner_lookup[value] for value in bundle.runner_ids]
-    canonical_xy = posterior_data["posterior_keypoints_xy"]
     first_pass_path = manifest.artifacts.get("first_pass_pose_npz")
-    if first_pass_path and Path(first_pass_path).is_file():
-        first_pass_data = np.load(Path(first_pass_path))
-        canonical_xy = first_pass_data["first_pass_keypoints_xy"]
+    if first_pass_path and (run_dir / first_pass_path).is_file():
+        with np.load(run_dir / first_pass_path, allow_pickle=False) as first_pass_data:
+            canonical_xy = np.asarray(first_pass_data["first_pass_keypoints_xy"], dtype=np.float32)
     posterior_full = canonical_xy[np.ix_(frame_selection, runner_selection)].astype(np.float32)
     conditioned_full = posterior_full.copy()
     confidence_full = quality_scores(
-        posterior_data["posterior_peak_probability"][np.ix_(frame_selection, runner_selection)],
-        posterior_data["posterior_entropy"][np.ix_(frame_selection, runner_selection)],
+        peak_probability[np.ix_(frame_selection, runner_selection)],
+        entropy[np.ix_(frame_selection, runner_selection)],
     )
     source_full = np.full(posterior_full.shape[:-1], "POSTERIOR", dtype="<U32")
     trusted_full = np.zeros(posterior_full.shape[:-1], dtype=bool)

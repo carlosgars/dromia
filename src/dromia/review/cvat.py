@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 from pydantic import BaseModel, Field
 
+from dromia import artifacts as dromia_artifacts
 from dromia import dto as dromia_dto
 
 # The pose model has no native neck output. ID 17 is an DromIA-only landmark
@@ -158,13 +159,6 @@ class ReviewSummary(BaseModel):
     artifacts: dict[str, str]
 
 
-class SchemaUpgradeSummary(BaseModel):
-    task_id: int
-    label_id: int
-    attribute: str = FRAME_GROUND_TRUTH_ATTRIBUTE
-    added: bool
-
-
 @dataclass(slots=True)
 class AnnotationState:
     points_xy: np.ndarray
@@ -236,8 +230,9 @@ def export_run(
 ) -> CvatBundle:
     run = run_dir.expanduser().resolve()
     manifest = load_manifest(run)
-    posterior_path = Path(required_artifact(manifest, "posterior_npz"))
-    posterior = np.load(posterior_path)
+    posterior_path = required_artifact(run, manifest, "posterior_npz")
+    with np.load(posterior_path, allow_pickle=False) as archive:
+        posterior = {key: np.asarray(archive[key]) for key in archive.files}
     frame_indices = posterior["frame_indices"].astype(np.int32)
     all_runner_ids = posterior["object_ids"].astype(np.int32)
     if runner_id is None:
@@ -250,9 +245,9 @@ def export_run(
     runner_ids = all_runner_ids[selected]
     preferred_xy = None
     first_pass_path = manifest.artifacts.get("first_pass_pose_npz")
-    if first_pass_path and Path(first_pass_path).is_file():
-        first_pass = np.load(Path(first_pass_path))
-        preferred_xy = np.asarray(first_pass["first_pass_keypoints_xy"], dtype=np.float32)
+    if first_pass_path and (run / first_pass_path).is_file():
+        with np.load(run / first_pass_path, allow_pickle=False) as first_pass:
+            preferred_xy = np.asarray(first_pass["first_pass_keypoints_xy"], dtype=np.float32)
     keypoints, peak, entropy = annotation_pose_arrays(
         posterior, selected, preferred_xy=preferred_xy
     )
@@ -263,9 +258,9 @@ def export_run(
     root = annotation_root or run / "annotations" / "cvat"
     annotation_dir = root / scope
     annotation_dir.mkdir(parents=True, exist_ok=True)
-    input_video = manifest.input_video
+    input_video = str((run / manifest.input_video).resolve())
     if runner_id is not None and crop_runner_media:
-        pose_path = Path(required_artifact(manifest, "pose_npz"))
+        pose_path = required_artifact(run, manifest, "pose_npz")
         with np.load(pose_path) as pose:
             bboxes = select_pose_bboxes(run, pose, frame_indices, runner_ids)[:, 0]
         visible = (
@@ -285,7 +280,7 @@ def export_run(
         task_frame_indices = np.arange(len(frame_indices), dtype=np.int32)
         input_video = str(
             write_runner_media_clip(
-                Path(manifest.input_video),
+                Path(input_video),
                 annotation_dir / f"runner_{runner_id}.mp4",
                 frame_indices,
             )
@@ -314,7 +309,7 @@ def export_run(
         task_name=" | ".join(
             part
             for part in (
-                Path(manifest.input_video).stem,
+                Path(input_video).stem,
                 scope,
                 run.name.split("_")[0],
                 task_name_suffix,
@@ -453,28 +448,6 @@ def create_scoped_task(
     return record
 
 
-def pull_run(
-    run_dir: Path,
-    connection: CvatConnection,
-    task_id: int | None = None,
-) -> ReviewSummary:
-    run = run_dir.expanduser().resolve()
-    record = find_task_record(run, task_id)
-    bundle = bundle_for_record(run, record)
-    try:
-        from cvat_sdk import make_client
-    except ImportError as exc:
-        raise RuntimeError("Install the annotation extra with: uv sync --extra annotation") from exc
-
-    with make_client(host=connection.host) as client:
-        client.login((connection.username, connection.password))
-        task = client.tasks.retrieve(record.task_id)
-        reviewed = remap_reviewed_frames_to_source(
-            parse_annotations(task.get_annotations(), task.get_labels()), bundle
-        )
-    return write_ground_truth(run, reviewed, task_id=record.task_id, bundle=bundle)
-
-
 def remap_reviewed_frames_to_source(
     reviewed: list[ReviewedFrame], bundle: CvatBundle
 ) -> list[ReviewedFrame]:
@@ -557,34 +530,6 @@ def frame_ground_truth_attribute(models: Any) -> Any:
     )
 
 
-def ensure_frame_ground_truth_attribute(
-    run_dir: Path,
-    connection: CvatConnection,
-    task_id: int | None = None,
-) -> SchemaUpgradeSummary:
-    """Add the checkbox to an existing DromIA CVAT project without recreating tasks."""
-
-    run = run_dir.expanduser().resolve()
-    record = find_task_record(run, task_id)
-    try:
-        from cvat_sdk import make_client, models
-    except ImportError as exc:
-        raise RuntimeError("Install the annotation extra with: uv sync --extra annotation") from exc
-    with make_client(host=connection.host) as client:
-        client.login((connection.username, connection.password))
-        task = client.tasks.retrieve(record.task_id)
-        label = next(item for item in task.get_labels() if item.name == "runner_lower_body")
-        if any(item.name == FRAME_GROUND_TRUTH_ATTRIBUTE for item in label.attributes):
-            return SchemaUpgradeSummary(task_id=record.task_id, label_id=int(label.id), added=False)
-        client.api_client.labels_api.partial_update(
-            int(label.id),
-            patched_label_request=models.PatchedLabelRequest(
-                attributes=[frame_ground_truth_attribute(models)]
-            ),
-        )
-        return SchemaUpgradeSummary(task_id=record.task_id, label_id=int(label.id), added=True)
-
-
 def skeleton_svg() -> str:
     positions = (
         (50, 12),
@@ -624,7 +569,9 @@ def build_annotations(
     label = next(item for item in labels if item.name == "runner_lower_body")
     sublabels = {item.name: item.id for item in label.sublabels}
     attributes = {item.name: item.id for item in label.attributes}
-    data = np.load(bundle.preannotations_npz)
+    with np.load(bundle.preannotations_npz, allow_pickle=False) as data:
+        data_frame_indices = np.asarray(data["frame_indices"], dtype=np.int32)
+        data_runner_ids = np.asarray(data["runner_ids"], dtype=np.int32)
     current = state or annotation_state(bundle)
     points = current.points_xy
     existing_ids = existing_annotation_id_index(
@@ -638,10 +585,10 @@ def build_annotations(
         ),
     )
     tracks = []
-    task_frames = bundle.task_frame_indices or data["frame_indices"].astype(int).tolist()
-    if len(task_frames) != len(data["frame_indices"]):
+    task_frames = bundle.task_frame_indices or data_frame_indices.astype(int).tolist()
+    if len(task_frames) != len(data_frame_indices):
         raise ValueError("CVAT task-frame mapping does not align with preannotations")
-    for obj_idx, runner_id in enumerate(data["runner_ids"].tolist()):
+    for obj_idx, runner_id in enumerate(data_runner_ids.tolist()):
         ids = existing_ids.get(int(runner_id), {})
         parent_shape_ids = ids.get("parent_shapes", {})
         element_ids = ids.get("elements", {})
@@ -787,11 +734,14 @@ def ground_truth_shape_count(track: Any, attribute_id: int | None) -> int:
 def annotation_state(
     bundle: CvatBundle, reviewed: list[ReviewedFrame] | None = None
 ) -> AnnotationState:
-    data = np.load(bundle.preannotations_npz)
-    points = data["posterior_keypoints_xy"].astype(np.float32).copy()
+    with np.load(bundle.preannotations_npz, allow_pickle=False) as data:
+        points = data["posterior_keypoints_xy"].astype(np.float32).copy()
+        data_frame_indices = np.asarray(data["frame_indices"], dtype=np.int32)
+        data_runner_ids = np.asarray(data["runner_ids"], dtype=np.int32)
+        frame_ground_truth = initial_frame_ground_truth_array(data, points.shape[:2])
+    original_points = points.copy()
     visibility = (np.isfinite(points).all(axis=-1) * 2).astype(np.uint8)
     status = np.full(points.shape[:2], "UNREVIEWED", dtype="<U16")
-    frame_ground_truth = initial_frame_ground_truth_array(data, points.shape[:2])
     keypoint_ground_truth = (
         frame_ground_truth[:, :, None] & (visibility > 0) & np.isfinite(points).all(axis=-1)
     )
@@ -803,8 +753,8 @@ def annotation_state(
             frame_ground_truth=frame_ground_truth,
             keypoint_ground_truth=keypoint_ground_truth,
         )
-    frame_to_t = {int(value): idx for idx, value in enumerate(data["frame_indices"])}
-    runner_to_idx = {int(value): idx for idx, value in enumerate(data["runner_ids"])}
+    frame_to_t = {int(value): idx for idx, value in enumerate(data_frame_indices)}
+    runner_to_idx = {int(value): idx for idx, value in enumerate(data_runner_ids)}
     joint_to_idx = {joint_id: idx for idx, joint_id in enumerate(JOINT_IDS)}
     frame_seen = np.zeros(points.shape[:2], dtype=bool)
     ground_truth_seen = np.zeros(points.shape[:2], dtype=bool)
@@ -836,7 +786,7 @@ def annotation_state(
             )
             should_replace = not point_seen[t, obj_idx, joint_idx]
             if point_seen[t, obj_idx, joint_idx]:
-                original = data["posterior_keypoints_xy"][t, obj_idx, joint_idx]
+                original = original_points[t, obj_idx, joint_idx]
                 current_delta = point_delta(points[t, obj_idx, joint_idx], original)
                 candidate_delta = point_delta(candidate, original)
                 incoming_priority = review_priority(frame.review_status)
@@ -990,10 +940,10 @@ def write_ground_truth(
 ) -> ReviewSummary:
     run = run_dir.expanduser().resolve()
     current_bundle = bundle or export_run(run)
-    data = np.load(current_bundle.preannotations_npz)
-    frame_indices = data["frame_indices"].astype(np.int32)
-    runner_ids = data["runner_ids"].astype(np.int32)
-    posterior = data["posterior_keypoints_xy"].astype(np.float32)
+    with np.load(current_bundle.preannotations_npz, allow_pickle=False) as data:
+        frame_indices = data["frame_indices"].astype(np.int32)
+        runner_ids = data["runner_ids"].astype(np.int32)
+        posterior = data["posterior_keypoints_xy"].astype(np.float32)
     shape = posterior.shape[:3]
     ground_truth = np.full((*shape, 2), np.nan, dtype=np.float32)
     visibility = np.zeros(shape, dtype=np.uint8)
@@ -1103,16 +1053,17 @@ def write_coco_ground_truth(
     keypoint_ground_truth: np.ndarray,
 ) -> None:
     manifest = load_manifest(run)
-    capture = cv2.VideoCapture(manifest.input_video)
+    video_path = run / manifest.input_video
+    capture = cv2.VideoCapture(str(video_path))
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     capture.release()
-    pose = np.load(Path(required_artifact(manifest, "pose_npz")))
-    bboxes = select_pose_bboxes(run, pose, frame_indices, runner_ids)
+    with np.load(required_artifact(run, manifest, "pose_npz"), allow_pickle=False) as pose:
+        bboxes = select_pose_bboxes(run, pose, frame_indices, runner_ids)
     images = [
         {
             "id": int(frame_idx),
-            "file_name": f"{Path(manifest.input_video).stem}#frame_{frame_idx:06d}",
+            "file_name": f"{video_path.stem}#frame_{frame_idx:06d}",
             "width": width,
             "height": height,
         }
@@ -1183,8 +1134,8 @@ def annotation_bbox_heights(
     runner_ids: np.ndarray,
 ) -> np.ndarray:
     manifest = load_manifest(run)
-    pose = np.load(Path(required_artifact(manifest, "pose_npz")))
-    bboxes = select_pose_bboxes(run, pose, frame_indices, runner_ids)
+    with np.load(required_artifact(run, manifest, "pose_npz"), allow_pickle=False) as pose:
+        bboxes = select_pose_bboxes(run, pose, frame_indices, runner_ids)
     return np.maximum(bboxes[..., 3] - bboxes[..., 1], 1.0)
 
 
@@ -1217,21 +1168,13 @@ def attributes_by_name(values: list[Any], names: dict[int, str]) -> dict[str, st
 
 
 def load_manifest(run_dir: Path) -> dromia_dto.RunManifest:
-    manifest = dromia_dto.RunManifest.model_validate_json(
-        (run_dir / "manifest.json").read_text(encoding="utf-8")
-    )
-    manifest.source_video.path = str((run_dir / manifest.source_video.path).resolve())
-    manifest.artifacts = {
-        name: str((run_dir / path).resolve()) for name, path in manifest.artifacts.items()
-    }
-    return manifest
+    return dromia_artifacts.RunLayout.open(run_dir).load_manifest()
 
 
-def required_artifact(manifest: dromia_dto.RunManifest, name: str) -> str:
-    path = manifest.artifacts.get(name)
-    if not path:
-        raise ValueError(f"Run manifest is missing artifact: {name}")
-    return path
+def required_artifact(
+    run_dir: Path, manifest: dromia_dto.RunManifest, name: str
+) -> Path:
+    return dromia_artifacts.RunLayout.open(run_dir).artifact(name, manifest)
 
 
 def write_annotation_readme(annotation_dir: Path) -> None:

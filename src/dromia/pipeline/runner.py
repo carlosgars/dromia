@@ -9,22 +9,24 @@ import random
 import shutil
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-import cv2
 import numpy as np
 
+from dromia import artifacts as dromia_artifacts
 from dromia import config as dromia_config
 from dromia import dto as dromia_dto
 from dromia import provenance as dromia_provenance
 from dromia import timebase as dromia_timebase
+from dromia import video as dromia_video
 from dromia.gait import analysis as postprocess_gait_analysis
 from dromia.models import cache as sam31_cache
 from dromia.models import crops as pose_crops
 from dromia.models import pmpose as pmpose_pose
 from dromia.pipeline import auto_pose_repair as postprocess_auto_pose_repair
+from dromia.pipeline import native_pose
 from dromia.pipeline import shoes as shoe_assignment
 from dromia.pipeline import temporal_biomechanics as postprocess_temporal_biomechanics
 from dromia.probability import heatmaps as heatmap_probability
@@ -183,8 +185,9 @@ def run(
         run_dir=run_dir,
     )
     frame_paths = sam31_cache.frame_paths(sam_cache)
-    frame_width = read_width(video)
-    frame_height = read_height(video)
+    video_info = dromia_video.inspect(video)
+    frame_width = video_info.width
+    frame_height = video_info.height
     lazy_masks = len(frame_paths) > 2_000
     sam_frames = [
         sam31_cache.load_frame(
@@ -206,9 +209,7 @@ def run(
         update={"video_path": run_video.relative_to(run_dir).as_posix()}
     )
     timebase_path = run_dir / "timebase.json"
-    timebase_path.write_text(
-        json.dumps(portable_timing.model_dump(mode="json"), indent=2), encoding="utf-8"
-    )
+    dromia_artifacts.atomic_write_json(timebase_path, portable_timing.model_dump(mode="json"))
     accepted_ids, decisions = select_real_runner_ids(
         sam_frames,
         frame_width=frame_width,
@@ -254,92 +255,24 @@ def run(
         posterior_peak_probability=stage_result.posterior_peak,
         posterior_entropy=stage_result.posterior_entropy,
     )
-    repair_result = None
-    pre_hmm_repair_result = None
-    post_hmm_repair_result = None
-    repair_tracker_warnings: list[str] = []
-    if config.auto_pose_repair.enabled:
-        # Identity decoding must see the untouched PMPose channels. Repairing a
-        # channel before its anatomical side is known can erase the evidence the
-        # HMM needs to perform a bilateral swap.
-        pre_hmm_repair_result = postprocess_auto_pose_repair.unchanged_repair_result(
-            stage_result.posterior_xy
-        )
-    # Identity has already been decoded from untouched PMPose channels before
-    # track-level shoe assignment and optional ankle refinement.
     temporal_result = stage_result.identity_result
-    temporal_xy = stage_result.posterior_xy.copy()
+    (
+        repair_result,
+        pre_hmm_repair_result,
+        post_hmm_repair_result,
+        repair_tracker_warnings,
+        hmm_xy,
+        temporal_xy,
+    ) = run_repair_stage(
+        video=video,
+        frame_indices=frame_indices,
+        object_ids=object_ids,
+        pose_xy=stage_result.posterior_xy,
+        bboxes_xyxy=stage_result.bboxes_xyxy,
+        quality=quality,
+        cfg=config.auto_pose_repair,
+    )
     temporal_restored_candidates = np.zeros(temporal_xy.shape[:3], dtype=bool)
-    hmm_xy = temporal_xy.copy()
-    if config.auto_pose_repair.enabled:
-        post_started = time.perf_counter()
-        # Registration maps were relabelled with the identity state before
-        # their quality was calculated, so applying the state again would undo it.
-        hmm_quality = quality
-        interval_flags, interval_reasons = postprocess_auto_pose_repair.detect_unstable_intervals(
-            hmm_xy,
-            stage_result.bboxes_xyxy,
-            hmm_quality,
-            config.auto_pose_repair,
-        )
-        interval_flags, interval_reasons = (
-            postprocess_auto_pose_repair.coalesce_incompatible_bilateral_intervals(
-                hmm_xy,
-                stage_result.bboxes_xyxy,
-                interval_flags,
-                interval_reasons,
-                config.auto_pose_repair,
-            )
-        )
-        post_probe = postprocess_auto_pose_repair.repair_pose(
-            hmm_xy,
-            stage_result.bboxes_xyxy,
-            None,
-            config.auto_pose_repair,
-            allow_interpolation=False,
-            detected_flags=interval_flags,
-            detected_reasons=interval_reasons,
-        )
-        post_unresolved = post_probe.flagged & (post_probe.method == 0)
-        post_tracker_candidates = None
-        post_tracker_visibility = None
-        if config.auto_pose_repair.tracker_enabled and np.any(post_unresolved):
-            post_tracker_candidates, post_tracker_visibility, tracker_warnings = (
-                postprocess_auto_pose_repair.run_bounded_cotracker(
-                    video_path=video,
-                    frame_indices=frame_indices,
-                    object_ids=object_ids,
-                    pose_xy=hmm_xy,
-                    bboxes_xyxy=stage_result.bboxes_xyxy,
-                    unresolved=post_unresolved,
-                    segments=post_probe.segments,
-                    cfg=config.auto_pose_repair,
-                )
-            )
-            repair_tracker_warnings.extend(tracker_warnings)
-        post_hmm_repair_result = postprocess_auto_pose_repair.repair_pose(
-            hmm_xy,
-            stage_result.bboxes_xyxy,
-            None,
-            config.auto_pose_repair,
-            tracker_candidate_xy=post_tracker_candidates,
-            tracker_visibility=post_tracker_visibility,
-            detected_flags=post_probe.flagged,
-            detected_reasons=post_probe.reasons,
-        )
-        post_hmm_repair_result.runtime_seconds = time.perf_counter() - post_started
-        if config.auto_pose_repair.final_step_cap_enabled:
-            post_hmm_repair_result = postprocess_auto_pose_repair.enforce_final_step_bound(
-                post_hmm_repair_result,
-                stage_result.bboxes_xyxy,
-                config.auto_pose_repair,
-            )
-        temporal_xy = post_hmm_repair_result.keypoints_xy
-        repair_result = postprocess_auto_pose_repair.merge_repair_results(
-            pre_hmm_repair_result,
-            post_hmm_repair_result,
-            original_xy=stage_result.posterior_xy,
-        )
 
     coordinate_source = build_coordinate_sources(
         identity_corrected_xy=stage_result.identity_corrected_xy,
@@ -423,37 +356,34 @@ def run(
             tracker_warnings=repair_tracker_warnings,
         )
     progress("gait_analysis", 0.72)
-    if config.gait_analysis.enabled:
-        progress("gait_analysis", 0.82)
-        gait_payload = postprocess_gait_analysis.analyze_gait(
-            frame_indices=frame_indices,
-            object_ids=object_ids,
-            pose_xy=first_pass_xy,
-            bboxes_xyxy=stage_result.bboxes_xyxy,
-            shoe_assignments=stage_result.shoe_assignments,
-            fps=timing.source_fps,
-            cfg=config.gait_analysis,
-            source_pose="first_pass_pose",
-            fps_is_assumed=False,
-            timebase=timing,
-        )
-        gait_artifacts = postprocess_gait_analysis.write_gait_artifacts(
-            gait_payload,
-            run_dir=run_dir,
-            video_path=video,
-            frame_indices=np.asarray(frame_indices, dtype=np.int32),
-            object_ids=np.asarray(object_ids, dtype=np.int32),
-            pose_xy=first_pass_xy,
-            shoe_assignments=stage_result.shoe_assignments,
-            fps=min(fps, 30.0),
-            draw_video=config.gait_analysis.draw_debug_video,
-        )
-    else:
-        gait_artifacts = {}
+    progress("gait_analysis", 0.82)
+    gait_payload = postprocess_gait_analysis.analyze_gait(
+        frame_indices=frame_indices,
+        object_ids=object_ids,
+        pose_xy=first_pass_xy,
+        bboxes_xyxy=stage_result.bboxes_xyxy,
+        shoe_assignments=stage_result.shoe_assignments,
+        fps=timing.source_fps,
+        cfg=config.gait_analysis,
+        source_pose="first_pass_pose",
+        fps_is_assumed=False,
+        timebase=timing,
+    )
+    gait_artifacts = postprocess_gait_analysis.write_gait_artifacts(
+        gait_payload,
+        run_dir=run_dir,
+        video_path=video,
+        frame_indices=np.asarray(frame_indices, dtype=np.int32),
+        object_ids=np.asarray(object_ids, dtype=np.int32),
+        pose_xy=first_pass_xy,
+        shoe_assignments=stage_result.shoe_assignments,
+        fps=min(fps, 30.0),
+        draw_video=config.gait_analysis.draw_debug_video,
+    )
 
     config_payload = config.model_dump(mode="json")
     config_path = run_dir / "config.json"
-    config_path.write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
+    dromia_artifacts.atomic_write_json(config_path, config_payload)
     config_fingerprint = hashlib.sha256(
         json.dumps(config_payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -528,6 +458,79 @@ def report_progress(
         callback(stage, fraction)
 
 
+def run_repair_stage(
+    *,
+    video: Path,
+    frame_indices: list[int],
+    object_ids: list[int],
+    pose_xy: np.ndarray,
+    bboxes_xyxy: np.ndarray,
+    quality: np.ndarray,
+    cfg: dromia_config.AutoPoseRepairConfig,
+) -> tuple[
+    postprocess_auto_pose_repair.RepairResult,
+    postprocess_auto_pose_repair.RepairResult,
+    postprocess_auto_pose_repair.RepairResult,
+    list[str],
+    np.ndarray,
+    np.ndarray,
+]:
+    """Run the fixed R1 repair sequence after anatomical identity decoding."""
+
+    pre_hmm = postprocess_auto_pose_repair.unchanged_repair_result(pose_xy)
+    hmm_xy = pose_xy.copy()
+    started = time.perf_counter()
+    flags, reasons = postprocess_auto_pose_repair.detect_unstable_intervals(
+        hmm_xy, bboxes_xyxy, quality, cfg
+    )
+    flags, reasons = postprocess_auto_pose_repair.coalesce_incompatible_bilateral_intervals(
+        hmm_xy, bboxes_xyxy, flags, reasons, cfg
+    )
+    probe = postprocess_auto_pose_repair.repair_pose(
+        hmm_xy,
+        bboxes_xyxy,
+        None,
+        cfg,
+        allow_interpolation=False,
+        detected_flags=flags,
+        detected_reasons=reasons,
+    )
+    unresolved = probe.flagged & (probe.method == 0)
+    tracker_xy = None
+    tracker_visibility = None
+    warnings: list[str] = []
+    if np.any(unresolved):
+        tracker_xy, tracker_visibility, warnings = (
+            postprocess_auto_pose_repair.run_bounded_cotracker(
+                video_path=video,
+                frame_indices=frame_indices,
+                object_ids=object_ids,
+                pose_xy=hmm_xy,
+                bboxes_xyxy=bboxes_xyxy,
+                unresolved=unresolved,
+                segments=probe.segments,
+                cfg=cfg,
+            )
+        )
+    post_hmm = postprocess_auto_pose_repair.repair_pose(
+        hmm_xy,
+        bboxes_xyxy,
+        None,
+        cfg,
+        tracker_candidate_xy=tracker_xy,
+        tracker_visibility=tracker_visibility,
+        detected_flags=probe.flagged,
+        detected_reasons=probe.reasons,
+    )
+    post_hmm.runtime_seconds = time.perf_counter() - started
+    post_hmm = postprocess_auto_pose_repair.enforce_final_step_bound(post_hmm, bboxes_xyxy, cfg)
+    repaired_xy = post_hmm.keypoints_xy
+    merged = postprocess_auto_pose_repair.merge_repair_results(
+        pre_hmm, post_hmm, original_xy=pose_xy
+    )
+    return merged, pre_hmm, post_hmm, warnings, hmm_xy, repaired_xy
+
+
 def set_random_seeds(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -567,22 +570,22 @@ def run_pose_stages(
     pose_runner = create_pose_runner(cfg.pose)
     posterior_dir = run_dir / "posterior" / "posteriors"
     posterior_dir.mkdir(parents=True, exist_ok=True)
-    observations: dict[tuple[int, int], dromia_dto.PoseObservation] = {}
-
-    capture = cv2.VideoCapture(str(video))
-    if not capture.isOpened():
-        raise RuntimeError(f"Could not open video: {video}")
+    observation_keys = [
+        (frame.frame_idx, runner.obj_id)
+        for frame in sam_frames
+        for runner in frame.runners
+        if runner.obj_id in object_to_index
+    ]
+    observations = native_pose.NativePoseStore(run_dir, observation_keys)
     try:
-        for t, sam_frame in enumerate(sam_frames):
-            capture.set(cv2.CAP_PROP_POS_FRAMES, sam_frame.frame_idx)
-            ok, frame = capture.read()
-            if not ok:
-                continue
+        decoded = dromia_video.ordered_frames(video, [item.frame_idx for item in sam_frames])
+        pairs = zip(sam_frames, decoded, strict=False)
+        for t, (sam_frame, (_frame_idx, frame)) in enumerate(pairs):
             runners = [r for r in sam_frame.runners if r.obj_id in object_to_index]
             for runner in runners:
                 obj_idx = object_to_index[runner.obj_id]
                 observation, _crop = pose_runner.predict(frame, runner)
-                observations[(sam_frame.frame_idx, runner.obj_id)] = observation
+                observations.add(observation)
                 raw_xy[t, obj_idx] = observation.keypoints_xy
                 raw_conf[t, obj_idx] = observation.confidence
                 copy_optional_joint_values(
@@ -599,25 +602,17 @@ def run_pose_stages(
                     observation.normalized_localization_error,
                 )
                 bboxes[t, obj_idx] = observation.bbox_xyxy
+    except BaseException:
+        observations.close()
+        raise
     finally:
-        capture.release()
         pose_runner.close()
 
-    native_outputs_npz = write_native_pmpose_outputs(observations, run_dir)
     identity_result = postprocess_temporal_biomechanics.decode_temporal_biomechanics(
         raw_xy,
         bboxes,
         cfg.temporal_biomechanics,
     )
-    if not cfg.temporal_biomechanics.enabled:
-        normal_probability = np.zeros_like(identity_result.state_probability)
-        normal_probability[..., 0] = 1.0
-        identity_result = replace(
-            identity_result,
-            corrected_xy=raw_xy.copy(),
-            state_path=np.zeros_like(identity_result.state_path),
-            state_probability=normal_probability,
-        )
     identity_xy = identity_result.corrected_xy
     pose_by_frame_runner = {
         (sam_frame.frame_idx, obj_id): identity_xy[t, object_to_index[obj_id]]
@@ -641,19 +636,13 @@ def run_pose_stages(
     write_shoe_assignments(stable_assignments, run_dir)
     assignment_lookup = shoe_assignment.assignments_by_frame_runner_side(stable_assignments)
 
-    capture = cv2.VideoCapture(str(video))
-    if not capture.isOpened():
-        raise RuntimeError(f"Could not open video: {video}")
     try:
-        for t, sam_frame in enumerate(sam_frames):
-            capture.set(cv2.CAP_PROP_POS_FRAMES, sam_frame.frame_idx)
-            ok, frame = capture.read()
-            if not ok:
-                continue
+        decoded = dromia_video.ordered_frames(video, [item.frame_idx for item in sam_frames])
+        pairs = zip(sam_frames, decoded, strict=False)
+        for t, (sam_frame, (_frame_idx, frame)) in enumerate(pairs):
             runners = [r for r in sam_frame.runners if r.obj_id in object_to_index]
             for runner in runners:
-                key = (sam_frame.frame_idx, runner.obj_id)
-                observation = observations.get(key)
+                observation = observations.get(sam_frame.frame_idx, runner.obj_id)
                 if observation is None:
                     continue
                 obj_idx = object_to_index[runner.obj_id]
@@ -702,8 +691,9 @@ def run_pose_stages(
                     bbox_xyxy=observation.bbox_xyxy,
                     metadata=observation.heatmap_metadata,
                 )
+        native_outputs_npz = observations.finalize(run_dir)
     finally:
-        capture.release()
+        observations.close()
     return PoseStageResult(
         raw_xy=raw_xy,
         raw_conf=raw_conf,
@@ -793,8 +783,7 @@ def build_shoe_ankle_refinement(
             0
         ]
         candidate_local, _candidate_peak, _candidate_entropy = posterior_probability.decode_maps(
-            candidate_map[None, ...],
-            method=cfg.posterior.decode_method,
+            candidate_map[None, ...]
         )
         candidate_global[joint_id] = crop.points_local_to_global(candidate_local)[0]
         raw_x, raw_y = np.rint(canonical_local[joint_id]).astype(np.int32)
@@ -810,8 +799,7 @@ def build_shoe_ankle_refinement(
             / max(float(compatibility[raw_y, raw_x]), posterior_probability.EPS)
         )
         if (
-            cfg.shoe_refinement.enabled
-            and peak_ratio >= cfg.shoe_refinement.min_peak_ratio_for_relocation
+            peak_ratio >= cfg.shoe_refinement.min_peak_ratio_for_relocation
             and compatibility_ratio >= cfg.shoe_refinement.min_compatibility_ratio_for_relocation
         ):
             selected_global[joint_id] = candidate_global[joint_id]
@@ -825,10 +813,7 @@ def build_shoe_ankle_refinement(
                 joint_ids=np.asarray([joint_id], dtype=np.int32),
                 peak_ratios=ratios,
             )
-    _decoded, peak, entropy = posterior_probability.decode_maps(
-        posterior_maps,
-        method=cfg.posterior.decode_method,
-    )
+    _decoded, peak, entropy = posterior_probability.decode_maps(posterior_maps)
     return (
         posterior_maps,
         selected_global,
@@ -1046,60 +1031,6 @@ def shoe_tracker_provenance(cache_dir: Path) -> str:
     return json.dumps(selected, sort_keys=True, separators=(",", ":"))
 
 
-def write_native_pmpose_outputs(
-    observations: dict[tuple[int, int], dromia_dto.PoseObservation],
-    run_dir: Path,
-) -> Path | None:
-    """Persist PMPose's native distributions and scalar heads without resampling."""
-
-    selected = [
-        observation
-        for _key, observation in sorted(observations.items())
-        if observation.heatmaps is not None
-        and observation.heatmap_metadata.get("heatmap_space") == "pmpose_affine_heatmap"
-    ]
-    if not selected:
-        return None
-    shapes = {np.asarray(item.heatmaps).shape for item in selected}
-    if len(shapes) != 1:
-        raise ValueError(f"PMPose native heatmaps must share one shape, got {sorted(shapes)}")
-
-    joint_count = int(np.asarray(selected[0].heatmaps).shape[0])
-
-    def scalar_rows(name: str) -> np.ndarray:
-        rows = []
-        for item in selected:
-            value = getattr(item, name)
-            if value is None:
-                rows.append(np.full(joint_count, np.nan, dtype=np.float32))
-            else:
-                rows.append(np.asarray(value, dtype=np.float32).reshape(joint_count))
-        return np.stack(rows)
-
-    path = run_dir / "pose" / "pmpose_native_outputs.npz"
-    np.savez_compressed(
-        path,
-        frame_indices=np.asarray([item.frame_idx for item in selected], dtype=np.int32),
-        object_ids=np.asarray([item.obj_id for item in selected], dtype=np.int32),
-        decoded_keypoints_xy=np.stack([item.keypoints_xy for item in selected]).astype(np.float32),
-        crop_xyxy=np.stack([item.crop_xyxy for item in selected]).astype(np.float32),
-        bbox_xyxy=np.stack([item.bbox_xyxy for item in selected]).astype(np.float32),
-        oks_confidence=np.stack([item.confidence for item in selected]).astype(np.float32),
-        heatmap_confidence=scalar_rows("heatmap_confidence"),
-        presence_probability=scalar_rows("presence_probability"),
-        visibility_probability=scalar_rows("visibility_probability"),
-        normalized_localization_error=scalar_rows("normalized_localization_error"),
-        native_heatmaps=np.stack(
-            [np.asarray(item.heatmaps, dtype=np.float16) for item in selected]
-        ),
-        heatmap_metadata=np.asarray(
-            [json.dumps(item.heatmap_metadata) for item in selected], dtype="<U2048"
-        ),
-        storage_format=np.asarray("pmpose_native_float16_v1"),
-    )
-    return path
-
-
 def crop_full_mask(mask: np.ndarray, crop_xyxy: np.ndarray) -> np.ndarray:
     x0, y0, x1, y1 = np.asarray(crop_xyxy, dtype=np.int32)
     return (np.asarray(mask) > 0).astype(np.uint8)[y0:y1, x0:x1]
@@ -1114,14 +1045,6 @@ def posterior_quality(peak: np.ndarray, entropy: np.ndarray) -> np.ndarray:
     return np.clip(0.5 * peak / peak_scale + 0.5 * sharpness, 0.0, 1.0).astype(np.float32)
 
 
-def pose_video_confidence(points_xy: np.ndarray, quality: np.ndarray) -> np.ndarray:
-    finite = np.isfinite(points_xy).all(axis=-1)
-    confidence = np.asarray(quality, dtype=np.float32).copy()
-    confidence[finite] = np.maximum(confidence[finite], 0.25)
-    confidence[~finite] = 0.0
-    return confidence
-
-
 def mask_or_bbox_center_x(detection: dromia_dto.SamDetection) -> float:
     bbox = np.asarray(detection.bbox_xyxy, dtype=np.float32)
     if not isinstance(detection.mask, sam31_cache.LazyNpzMask):
@@ -1129,31 +1052,6 @@ def mask_or_bbox_center_x(detection: dromia_dto.SamDetection) -> float:
         if len(xs):
             return float(xs.mean())
     return float((bbox[0] + bbox[2]) * 0.5)
-
-
-def read_width(video: Path) -> int:
-    capture = cv2.VideoCapture(str(video))
-    try:
-        return int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-    finally:
-        capture.release()
-
-
-def read_height(video: Path) -> int:
-    capture = cv2.VideoCapture(str(video))
-    try:
-        return int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    finally:
-        capture.release()
-
-
-def read_fps(video: Path) -> float:
-    capture = cv2.VideoCapture(str(video))
-    try:
-        fps = float(capture.get(cv2.CAP_PROP_FPS))
-        return fps if fps > 0 else 30.0
-    finally:
-        capture.release()
 
 
 def make_run_dir(video: Path, runs_dir: Path, *, pose_model: str) -> Path:
@@ -1188,9 +1086,8 @@ def relative_artifacts(artifacts: dict[str, str], run_dir: Path) -> dict[str, st
 
 
 def write_manifest_and_readme(manifest: dromia_dto.RunManifestV1, run_dir: Path) -> None:
-    (run_dir / "manifest.json").write_text(
-        json.dumps(manifest.model_dump(mode="json"), indent=2),
-        encoding="utf-8",
+    dromia_artifacts.atomic_write_json(
+        run_dir / "manifest.json", manifest.model_dump(mode="json")
     )
     lines = [
         "# DromIA Run",

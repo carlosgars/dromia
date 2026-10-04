@@ -257,15 +257,15 @@ class Handler(BaseHTTPRequestHandler):
     def _file(self, path: Path, content_type: str, *, attachment: bool = False) -> None:
         if not path.is_file():
             return self._json(HTTPStatus.NOT_FOUND, {"error": "artifact_not_generated"})
-        body = path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self._cors()
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(path.stat().st_size))
         if attachment:
             self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
         self.end_headers()
-        self.wfile.write(body)
+        with path.open("rb") as source:
+            shutil.copyfileobj(source, self.wfile, length=1024 * 1024)
 
     def _cors(self) -> None:
         origin = self.headers.get("Origin", "")

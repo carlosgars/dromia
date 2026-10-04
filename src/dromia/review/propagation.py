@@ -153,13 +153,16 @@ def propagate_run(
                 diagnostics.quality_warnings["TRACKER_FAILED"] = 1
                 diagnostics.quality_warnings[f"TRACKER_ERROR:{type(exc).__name__}"] = 1
         manifest = cvat_annotation.load_manifest(run)
-        pose = np.load(Path(cvat_annotation.required_artifact(manifest, "pose_npz")))
-        bboxes = cvat_annotation.select_pose_bboxes(
-            run,
-            pose,
-            np.asarray(bundle.frame_indices, dtype=np.int32),
-            np.asarray(bundle.runner_ids, dtype=np.int32),
-        )
+        with np.load(
+            cvat_annotation.required_artifact(run, manifest, "pose_npz"),
+            allow_pickle=False,
+        ) as pose:
+            bboxes = cvat_annotation.select_pose_bboxes(
+                run,
+                pose,
+                np.asarray(bundle.frame_indices, dtype=np.int32),
+                np.asarray(bundle.runner_ids, dtype=np.int32),
+            )
         conditioned = human_conditioning.condition_pose(
             run_dir=run,
             bundle=bundle,
@@ -335,11 +338,6 @@ def track_correction_windows(
     )
 
 
-def seed_hash(seed: CorrectionSeed) -> str:
-    value = f"{seed.runner_id}:{seed.joint_id}:{seed.frame_idx}:{seed.xy[0]:.3f}:{seed.xy[1]:.3f}"
-    return hashlib.sha256(value.encode()).hexdigest()[:16]
-
-
 def trusted_hash(observation: human_conditioning.TrustedObservation) -> str:
     value = (
         f"{PROPAGATION_ALGORITHM_VERSION}:{human_conditioning.ALGORITHM_VERSION}:"
@@ -405,16 +403,16 @@ def previous_proposal_mask(
     path = propagation_output_dir(run, bundle) / "propagation.npz"
     if not path.exists():
         return np.zeros(shape, dtype=bool)
-    data = np.load(path)
-    aligned = (
-        np.array_equal(data["frame_indices"], np.asarray(bundle.frame_indices))
-        and np.array_equal(data["runner_ids"], np.asarray(bundle.runner_ids))
-        and data["proposal_applied"].shape == shape
-    )
-    if not aligned:
-        return np.zeros(shape, dtype=bool)
-    unchanged = np.isclose(data["propagated_xy"], current_points, atol=0.25).all(axis=-1)
-    return data["proposal_applied"].astype(bool) & unchanged
+    with np.load(path, allow_pickle=False) as data:
+        aligned = (
+            np.array_equal(data["frame_indices"], np.asarray(bundle.frame_indices))
+            and np.array_equal(data["runner_ids"], np.asarray(bundle.runner_ids))
+            and data["proposal_applied"].shape == shape
+        )
+        if not aligned:
+            return np.zeros(shape, dtype=bool)
+        unchanged = np.isclose(data["propagated_xy"], current_points, atol=0.25).all(axis=-1)
+        return data["proposal_applied"].astype(bool) & unchanged
 
 
 def restore_previous_proposals(
@@ -426,7 +424,8 @@ def restore_previous_proposals(
 
     if not np.any(previous_proposal):
         return state
-    posterior = np.load(bundle.preannotations_npz)["posterior_keypoints_xy"]
+    with np.load(bundle.preannotations_npz, allow_pickle=False) as data:
+        posterior = np.asarray(data["posterior_keypoints_xy"], dtype=np.float32)
     restored = cvat_annotation.AnnotationState(
         points_xy=state.points_xy.copy(),
         visibility=state.visibility.copy(),
@@ -444,8 +443,8 @@ def correction_seeds(
     state: cvat_annotation.AnnotationState,
     cfg: PropagationConfig,
 ) -> list[CorrectionSeed]:
-    data = np.load(bundle.preannotations_npz)
-    posterior = data["posterior_keypoints_xy"]
+    with np.load(bundle.preannotations_npz, allow_pickle=False) as data:
+        posterior = np.asarray(data["posterior_keypoints_xy"], dtype=np.float32)
     seeds: list[CorrectionSeed] = []
     for t, frame_idx in enumerate(bundle.frame_indices):
         for obj_idx, runner_id in enumerate(bundle.runner_ids):

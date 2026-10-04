@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 
+from dromia import artifacts
 from dromia import config as dromia_config
 from dromia import dto as dromia_dto
 from dromia.models import mlx_runner as sam31_mlx_runner
@@ -49,11 +49,6 @@ def ensure_sam_cache(
         )
     )
     return cache_root
-
-
-def sam_cache_root(video_path: Path, *, cfg: dromia_config.DromiaConfig) -> Path:
-    digest = video_hash(video_path)[:12]
-    return cfg.cache_dir / "sam31_mlx" / f"{video_path.stem}_{digest}"
 
 
 def cache_is_valid(
@@ -212,20 +207,8 @@ def load_frame(
     return dromia_dto.SamFrame(frame_idx=frame_idx, detections=detections)
 
 
-def video_hash(video_path: Path) -> str:
-    hasher = hashlib.sha1()
-    with video_path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
 def file_sha256(path: Path) -> str:
-    hasher = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(4 * 1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+    return artifacts.file_sha256(path)
 
 
 def verify_checksums(cache_root: Path) -> str | None:

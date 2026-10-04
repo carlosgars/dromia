@@ -253,11 +253,14 @@ def build_reviewed_pose(
     state: cvat_annotation.AnnotationState,
 ) -> ReviewedPoseData:
     manifest = cvat_annotation.load_manifest(run)
-    automatic_path = manifest.artifacts.get("first_pass_pose_npz") or (
-        cvat_annotation.required_artifact(manifest, "posterior_npz")
+    automatic_path = manifest.artifacts.get("first_pass_pose_npz")
+    resolved = (
+        run / automatic_path
+        if automatic_path is not None
+        else cvat_annotation.required_artifact(run, manifest, "posterior_npz")
     )
-    posterior_data = np.load(Path(automatic_path))
-    posterior = select_posterior_pose(posterior_data, bundle)
+    with np.load(resolved, allow_pickle=False) as posterior_data:
+        posterior = select_posterior_pose(posterior_data, bundle)
     reviewed = posterior.copy()
     visibility = (np.isfinite(posterior).all(axis=-1) * 2).astype(np.uint8)
     source = np.full(posterior.shape[:-1], SOURCE_POSTERIOR, dtype="<U24")
@@ -349,13 +352,13 @@ def load_propagation_flags(
     path = annotation_propagation.propagation_output_dir(run, bundle) / "propagation.npz"
     if not path.exists():
         return np.zeros(shape, dtype=bool)
-    data = np.load(path)
-    aligned = (
-        np.array_equal(data["frame_indices"], np.asarray(bundle.frame_indices))
-        and np.array_equal(data["runner_ids"], np.asarray(bundle.runner_ids))
-        and data["proposal_applied"].shape == shape
-    )
-    return data["proposal_applied"].astype(bool) if aligned else np.zeros(shape, dtype=bool)
+    with np.load(path, allow_pickle=False) as data:
+        aligned = (
+            np.array_equal(data["frame_indices"], np.asarray(bundle.frame_indices))
+            and np.array_equal(data["runner_ids"], np.asarray(bundle.runner_ids))
+            and data["proposal_applied"].shape == shape
+        )
+        return data["proposal_applied"].astype(bool) if aligned else np.zeros(shape, dtype=bool)
 
 
 def expand_lower_body(lower: np.ndarray, full_shape: tuple[int, ...]) -> np.ndarray:
@@ -422,9 +425,10 @@ def write_reviewed_videos(
     bundle: cvat_annotation.CvatBundle,
 ) -> dict[str, str]:
     manifest = cvat_annotation.load_manifest(run)
-    video_path = Path(manifest.input_video)
+    video_path = run / manifest.input_video
     sam_frames = [
-        sam_cache.load_frame(path) for path in sam_cache.frame_paths(Path(manifest.sam_cache_dir))
+        sam_cache.load_frame(path)
+        for path in sam_cache.frame_paths(run / manifest.sam_cache_dir)
     ]
     frames_by_idx = {frame.frame_idx: frame for frame in sam_frames}
     suffix = scope_suffix(bundle)

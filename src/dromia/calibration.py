@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 from pathlib import Path
@@ -109,40 +108,3 @@ def save_ground_calibration(run_dir: Path, calibration: GroundCalibration) -> Pa
     )
     temporary.replace(path)
     return path
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Calibrate an DromIA ground rectangle")
-    parser.add_argument("run_dir", type=Path)
-    parser.add_argument(
-        "--points",
-        type=float,
-        nargs=8,
-        metavar=("X1", "Y1", "X2", "Y2", "X3", "Y3", "X4", "Y4"),
-        required=True,
-    )
-    parser.add_argument("--longitudinal-m", type=float, default=4.0)
-    parser.add_argument("--transverse-m", type=float, default=6.0)
-    parser.add_argument("--validation-error-m", type=float)
-    parser.add_argument(
-        "--travel-direction", choices=("left_to_right", "right_to_left"), default="left_to_right"
-    )
-    args = parser.parse_args()
-    run = args.run_dir.resolve()
-    timebase = json.loads((run / "timebase.json").read_text())
-    points = list(zip(args.points[::2], args.points[1::2], strict=True))
-    calibration = fit_ground_calibration(
-        video_sha256=timebase["video_sha256"],
-        image_points_xy=points,
-        longitudinal_m=args.longitudinal_m,
-        transverse_m=args.transverse_m,
-        validation_error_m=args.validation_error_m,
-        travel_direction=args.travel_direction,
-    )
-    path = save_ground_calibration(run, calibration)
-    print(json.dumps({"artifact": str(path), **calibration.model_dump(mode="json")}, indent=2))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

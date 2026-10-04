@@ -16,11 +16,6 @@ import numpy as np
 
 from dromia import config as dromia_config
 
-LIMB_PAIRS = ((5, 7), (7, 9), (6, 8), (8, 10), (11, 13), (13, 15), (12, 14), (14, 16))
-LIMB_NEIGHBORS = {
-    joint: tuple(other for pair in LIMB_PAIRS if joint in pair for other in pair if other != joint)
-    for joint in range(17)
-}
 METHOD_NONE = np.uint8(0)
 METHOD_PLAIN = np.uint8(1)
 METHOD_TRACKER = np.uint8(2)
@@ -28,7 +23,6 @@ METHOD_INTERPOLATION = np.uint8(3)
 METHOD_NAMES = {0: "none", 1: "plain_pmpose", 2: "cotracker", 3: "boundary_interpolation"}
 REASON_BBOX = np.uint8(1)
 REASON_VELOCITY = np.uint8(2)
-REASON_LIMB_LENGTH = np.uint8(4)
 REASON_HEATMAP_ALIGNMENT = np.uint8(8)
 REASON_BILATERAL_COLLAPSE = np.uint8(16)
 REASON_MIXED_POSE = np.uint8(32)
@@ -36,7 +30,6 @@ REASON_IDENTITY_ANCHOR_MISMATCH = np.uint8(64)
 REASON_NAMES = {
     int(REASON_BBOX): "bbox_exit",
     int(REASON_VELOCITY): "velocity",
-    int(REASON_LIMB_LENGTH): "limb_length",
     int(REASON_HEATMAP_ALIGNMENT): "heatmap_alignment",
     int(REASON_BILATERAL_COLLAPSE): "bilateral_collapse",
     int(REASON_MIXED_POSE): "mixed_pose",
@@ -112,23 +105,6 @@ def detect_catastrophic_drift(
     weak_jump = velocity > cfg.weak_jump_threshold_norm
     reasons[weak_jump] |= REASON_VELOCITY
 
-    limb_bad = np.zeros_like(finite)
-    if cfg.limb_length_enabled:
-        for a, b in LIMB_PAIRS:
-            length = np.linalg.norm(pose[:, :, a] - pose[:, :, b], axis=-1) / heights
-            usable = np.isfinite(length) & ~outside[:, :, a] & ~outside[:, :, b]
-            for obj_idx in range(pose.shape[1]):
-                values = length[:, obj_idx][usable[:, obj_idx]]
-                if not values.size:
-                    continue
-                median = float(np.median(values))
-                if median <= 1e-6:
-                    continue
-                bad = np.abs(length[:, obj_idx] - median) / median > cfg.limb_relative_deviation
-                limb_bad[:, obj_idx, a] |= bad
-                limb_bad[:, obj_idx, b] |= bad
-    reasons[limb_bad] |= REASON_LIMB_LENGTH
-
     heatmap_bad = np.zeros_like(finite)
     if alignment_error_px is not None:
         errors = np.asarray(alignment_error_px, dtype=np.float32)
@@ -157,7 +133,7 @@ def detect_catastrophic_drift(
     reasons[mixed_pose_joint] |= REASON_MIXED_POSE
 
     severe = outside | severe_jump | heatmap_bad | bilateral_collapse | mixed_pose_joint
-    weak_count = weak_jump.astype(np.uint8) + limb_bad.astype(np.uint8)
+    weak_count = weak_jump.astype(np.uint8)
     per_joint_scope = np.zeros(pose.shape[2], dtype=bool)
     per_joint_scope[
         [joint_id for joint_id in cfg.per_joint_trigger_ids if joint_id < pose.shape[2]]
@@ -520,23 +496,6 @@ def candidate_is_valid(
         and box[1] - pad <= candidate[1] <= box[3] + pad
     ):
         return False
-    if cfg.limb_length_enabled:
-        for neighbor in LIMB_NEIGHBORS.get(joint, ()):
-            other = reference_xy[t, obj, neighbor]
-            if not np.all(np.isfinite(other)):
-                continue
-            candidate_length = float(np.linalg.norm(candidate - other) / height)
-            history = np.linalg.norm(
-                reference_xy[:, obj, joint] - reference_xy[:, obj, neighbor], axis=-1
-            ) / np.maximum(bboxes_xyxy[:, obj, 3] - bboxes_xyxy[:, obj, 1], 1.0)
-            history = history[np.isfinite(history) & (history < 0.8)]
-            if history.size:
-                median = float(np.median(history))
-                if (
-                    median > 1e-6
-                    and abs(candidate_length - median) / median > cfg.limb_relative_deviation
-                ):
-                    return False
     return True
 
 

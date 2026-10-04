@@ -21,6 +21,6 @@ Before a public push:
 1. Confirm the exact license files at every pinned revision.
 2. Decide whether invoking locally downloaded GPL and non-commercial model code is compatible
    with the intended DromIA distribution and use.
-3. Choose DromIA's source license and replace the placeholder repository URL in `CITATION.cff`.
+3. Choose DromIA's source license and validate the publication metadata in `CITATION.cff`.
 4. Add `LICENSE`, retain `THIRD_PARTY_NOTICES.md`, and publish `dromia` and `dromia-cvat`
    together.

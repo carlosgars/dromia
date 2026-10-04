@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import signal
@@ -120,16 +119,3 @@ def process_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Manage the local DromIA/CVAT stack")
-    parser.add_argument("command", choices=("up", "down", "health"))
-    args = parser.parse_args()
-    result = up() if args.command == "up" else down() if args.command == "down" else health()
-    print(json.dumps(result, indent=2))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

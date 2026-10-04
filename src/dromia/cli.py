@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -33,11 +34,15 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == "models":
-        result = (
-            store.install(accept_licenses=args.accept_licenses)
-            if args.models_command == "install"
-            else store.verify()
-        )
+        try:
+            result = (
+                store.install(accept_licenses=args.accept_licenses)
+                if args.models_command == "install"
+                else store.verify()
+            )
+        except (RuntimeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     elif args.command == "run":
         base = dromia_config.DromiaConfig()
         updates: dict[str, object] = {}

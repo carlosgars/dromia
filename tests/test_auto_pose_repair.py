@@ -116,10 +116,9 @@ def test_high_confidence_style_offscreen_failure_is_flagged_per_joint() -> None:
     assert not np.any(flagged[:10])
 
 
-def test_production_defaults_disable_limb_length_prior_and_repair_gate() -> None:
+def test_production_defaults_disable_temporal_limb_length_prior() -> None:
     from dromia.config import TemporalBiomechanicsConfig
 
-    assert not AutoPoseRepairConfig().limb_length_enabled
     assert TemporalBiomechanicsConfig().limb_length_weight == 0.0
 
 

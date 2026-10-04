@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from dromia import temporal_calibration
+from dromia import gait_contract, temporal_calibration
 from dromia.gait import analysis as gait_analysis
 
 
@@ -35,7 +35,7 @@ def test_recalibrates_existing_metrics_without_touching_debug_video(tmp_path: Pa
         {"runner_id": 7, "side": "right", "landing_frame": 85, "takeoff_frame": 85},
     ]
     payload = {
-        "schema_version": 8,
+        "schema_version": gait_contract.SCHEMA_VERSION,
         "fps": 30.0,
         "timebase": timing.model_dump(mode="json"),
         "limitations": [],

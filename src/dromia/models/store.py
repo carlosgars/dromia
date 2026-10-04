@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 import subprocess
@@ -12,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from huggingface_hub import snapshot_download
+
+from dromia import artifacts
 
 ROOT = Path(__file__).resolve().parents[3]
 MANIFEST = ROOT / "models" / "manifest.toml"
@@ -26,11 +27,7 @@ def load_manifest() -> dict[str, Any]:
 
 
 def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return artifacts.file_sha256(path)
 
 
 def download(url: str, destination: Path) -> None:

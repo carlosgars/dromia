@@ -6,13 +6,14 @@ those indices into seconds without silently substituting an analysis frame rate.
 
 from __future__ import annotations
 
-import hashlib
 import struct
 from pathlib import Path
 
 import cv2
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
+
+from dromia import artifacts
 
 
 class VideoTimebase(BaseModel):
@@ -279,11 +280,7 @@ def elapsed_s(timebase: VideoTimebase, start_frame: int, end_frame: int) -> floa
 
 
 def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(chunk_size):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return artifacts.file_sha256(path, chunk_size)
 
 
 def usable_decoded_timestamps(values: list[float]) -> bool:

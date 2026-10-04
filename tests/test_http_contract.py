@@ -1,4 +1,5 @@
 import json
+from http import HTTPStatus
 
 from dromia.review import cvat, service
 
@@ -38,3 +39,32 @@ def test_task_lookup_uses_only_versioned_registry(tmp_path):
     assert found is not None
     assert found[0] == run
     assert found[1] == record
+
+
+def test_artifacts_are_streamed_in_bounded_chunks(tmp_path):
+    path = tmp_path / "artifact.bin"
+    path.write_bytes(b"x" * (2 * 1024 * 1024 + 17))
+
+    class ChunkSink:
+        def __init__(self):
+            self.lengths = []
+
+        def write(self, value):
+            self.lengths.append(len(value))
+            return len(value)
+
+    handler = object.__new__(service.Handler)
+    handler.wfile = ChunkSink()
+    handler.headers = {}
+    statuses = []
+    headers = {}
+    handler.send_response = statuses.append
+    handler.send_header = headers.__setitem__
+    handler.end_headers = lambda: None
+
+    handler._file(path, "application/octet-stream")
+
+    assert statuses == [HTTPStatus.OK]
+    assert headers["Content-Length"] == str(path.stat().st_size)
+    assert len(handler.wfile.lengths) == 3
+    assert max(handler.wfile.lengths) <= 1024 * 1024

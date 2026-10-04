@@ -7,8 +7,6 @@ piece can be calibrated or replaced without changing the artifact contract.
 
 from __future__ import annotations
 
-import argparse
-import csv
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -25,6 +23,7 @@ from dromia import config as dromia_config
 from dromia import dto as dromia_dto
 from dromia import gait_contract
 from dromia import timebase as dromia_timebase
+from dromia.gait import artifacts as gait_artifacts
 from dromia.models import cache as sam31_cache
 
 SIDES = ("left", "right")
@@ -135,7 +134,6 @@ def analyze_gait(
     fps_is_assumed: bool = False,
     timebase: dromia_timebase.VideoTimebase | None = None,
     calibration: dromia_calibration.GroundCalibration | None = None,
-    ground_line: GroundLine | None = None,
     ground_lines: dict[tuple[int, str], GroundLine] | None = None,
 ) -> dict[str, Any]:
     """Compute per-frame geometry and per-contact gait events for every runner."""
@@ -188,10 +186,9 @@ def analyze_gait(
         cfg,
         fps=timing.real_world_fps or timing.source_fps,
         directions=directions,
-        global_ground=ground_line,
         ground_lines=ground_lines,
     )
-    ground_model = ground_model_summary(shoe_frames, cfg)
+    ground_model = ground_model_summary(shoe_frames)
     shoe_lookup = {(x.frame_idx, x.runner_id, x.side): x for x in shoe_frames}
     runner_payload: dict[str, Any] = {}
     for obj_idx, runner_id_raw in enumerate(runners):
@@ -278,16 +275,8 @@ def analyze_gait(
         "runners": runner_payload,
         "limitations": [
             "Angles are 2D image-plane projections and are not perspective corrected.",
-            (
-                "Ground contact uses one robust spatial line per runner and shoe, with a "
-                "jointly estimated and physically bounded camera-tilt slope."
-                if cfg.ground_model == "per_shoe_line"
-                else "Ground contact uses one robust spatial line fitted to the global lower "
-                "shoe envelope."
-                if cfg.ground_model == "global_line"
-                else "Each foot uses an independently interpolated ground path through local "
-                "step anchors."
-            ),
+            "Ground contact uses one robust spatial line per runner and shoe, with a "
+            "jointly estimated and physically bounded camera-tilt slope.",
             "Contact timing precision is limited to one video frame.",
             "Contact intervals touching a clip boundary are reported as censored.",
             "Metric distances are reported only for valid ground-plane calibration.",
@@ -297,58 +286,29 @@ def analyze_gait(
     }
 
 
-def ground_model_summary(
-    frames: list[ShoeFrame], cfg: dromia_config.GaitAnalysisConfig
-) -> dict[str, Any]:
-    if cfg.ground_model == "per_shoe_line":
-        lines = {
-            str(runner_id): runner_ground_lines(runner_id, frames)
-            for runner_id in sorted({item.runner_id for item in frames})
-        }
-        runner_slopes = {
-            runner_id: float(
-                np.median(
-                    [
-                        float(line["slope"])
-                        for line in runner.values()
-                        if line.get("slope") is not None
-                    ]
-                )
+def ground_model_summary(frames: list[ShoeFrame]) -> dict[str, Any]:
+    lines = {
+        str(runner_id): runner_ground_lines(runner_id, frames)
+        for runner_id in sorted({item.runner_id for item in frames})
+    }
+    runner_slopes = {
+        runner_id: float(
+            np.median(
+                [float(line["slope"]) for line in runner.values() if line.get("slope") is not None]
             )
-            for runner_id, runner in lines.items()
-            if any(line.get("slope") is not None for line in runner.values())
-        }
-        return {
-            "model": "per_runner_per_shoe_spatial_lines",
-            "equation": "y = slope * x + intercept",
-            "runner_slopes": runner_slopes,
-            "runner_angles_deg": {
-                runner_id: float(np.degrees(np.arctan(slope)))
-                for runner_id, slope in runner_slopes.items()
-            },
-            "lines": lines,
-        }
-    fitted = next(
-        (
-            item
-            for item in frames
-            if item.ground_line_quality is not None
-            and item.ground_line_slope is not None
-            and item.ground_line_intercept is not None
-        ),
-        None,
-    )
-    if fitted is None:
-        return {"model": cfg.ground_model, "quality": "per_step_or_not_available"}
+        )
+        for runner_id, runner in lines.items()
+        if any(line.get("slope") is not None for line in runner.values())
+    }
     return {
-        "model": "global_spatial_line",
+        "model": "per_runner_per_shoe_spatial_lines",
         "equation": "y = slope * x + intercept",
-        "slope": fitted.ground_line_slope,
-        "intercept": fitted.ground_line_intercept,
-        "r2": fitted.ground_line_r2,
-        "quality": fitted.ground_line_quality,
-        "candidate_count": fitted.ground_line_candidate_count,
-        "bin_count": fitted.ground_line_bin_count,
+        "runner_slopes": runner_slopes,
+        "runner_angles_deg": {
+            runner_id: float(np.degrees(np.arctan(slope)))
+            for runner_id, slope in runner_slopes.items()
+        },
+        "lines": lines,
     }
 
 
@@ -546,7 +506,6 @@ def analyze_shoes(
     *,
     fps: float = 30.0,
     directions: dict[int, str] | None = None,
-    global_ground: GroundLine | None = None,
     ground_lines: dict[tuple[int, str], GroundLine] | None = None,
 ) -> list[ShoeFrame]:
     frame_pos = {int(value): idx for idx, value in enumerate(frame_indices)}
@@ -588,14 +547,7 @@ def analyze_shoes(
                 floor_candidate_eligible=floor_candidate_eligible,
             )
         )
-    fitted_lines: dict[tuple[int, str], GroundLine] = {}
-    if cfg.ground_model == "per_shoe_line":
-        fitted_lines = ground_lines or fit_per_shoe_ground_lines(output, cfg, fps=fps)
-    elif cfg.ground_model == "global_line":
-        global_ground = global_ground or fit_global_ground_line(output, cfg)
-        fitted_lines = {
-            (int(runner_id), side): global_ground for runner_id in object_ids for side in SIDES
-        }
+    fitted_lines = ground_lines or fit_per_shoe_ground_lines(output, cfg, fps=fps)
     if fitted_lines:
         for item in output:
             if item.max_y is None or item.ground_x is None:
@@ -884,114 +836,6 @@ def spatial_ground_envelope(
             )
         )
     return np.asarray(envelope, dtype=np.float64), len(candidates)
-
-
-def fit_global_ground_line(
-    frames: list[ShoeFrame], cfg: dromia_config.GaitAnalysisConfig
-) -> GroundLine:
-    """Fit one robust spatial line to the global lower shoe envelope.
-
-    Image ``y`` grows downwards, so contact candidates live near the upper
-    quantile of outsole-bottom coordinates. Equal-width spatial bins prevent a
-    long or densely sampled stance from dominating the fit. A non-horizontal
-    slope is accepted only when the binned envelope supports it strongly.
-    """
-
-    candidates = np.asarray(
-        [
-            (float(item.ground_x), float(item.max_y))
-            for item in frames
-            if item.ground_x is not None
-            and item.max_y is not None
-            and np.isfinite(item.ground_x)
-            and np.isfinite(item.max_y)
-        ],
-        dtype=np.float64,
-    )
-    if not len(candidates):
-        return GroundLine(0.0, 0.0, 0.0, 0, 0, "not_available")
-    x_min, x_max = float(np.min(candidates[:, 0])), float(np.max(candidates[:, 0]))
-    if x_max - x_min <= EPS:
-        intercept = float(np.percentile(candidates[:, 1], cfg.ground_line_candidate_quantile))
-        return GroundLine(0.0, intercept, 1.0, len(candidates), 1, "horizontal_fallback")
-
-    edges = np.linspace(x_min, x_max, cfg.ground_line_bin_count + 1)
-    envelope: list[tuple[float, float]] = []
-    for index, (left, right) in enumerate(zip(edges[:-1], edges[1:], strict=True)):
-        selected = (candidates[:, 0] >= left) & (
-            candidates[:, 0] < right if index < len(edges) - 2 else candidates[:, 0] <= right
-        )
-        values = candidates[selected]
-        if len(values) < cfg.ground_line_min_candidates_per_bin:
-            continue
-        envelope.append(
-            (
-                float(np.median(values[:, 0])),
-                float(np.percentile(values[:, 1], cfg.ground_line_candidate_quantile)),
-            )
-        )
-    if len(envelope) < 2:
-        intercept = float(np.percentile(candidates[:, 1], cfg.ground_line_candidate_quantile))
-        return GroundLine(
-            0.0,
-            intercept,
-            0.0,
-            len(candidates),
-            len(envelope),
-            "horizontal_fallback",
-        )
-
-    envelope_xy = np.asarray(envelope, dtype=np.float64)
-    slope, intercept = np.polyfit(envelope_xy[:, 0], envelope_xy[:, 1], 1)
-    predicted = slope * envelope_xy[:, 0] + intercept
-    residual_sum = float(np.sum((envelope_xy[:, 1] - predicted) ** 2))
-    total_sum = float(np.sum((envelope_xy[:, 1] - np.mean(envelope_xy[:, 1])) ** 2))
-    r2 = 1.0 if total_sum <= EPS else max(0.0, 1.0 - residual_sum / total_sum)
-    total_rise = abs(float(slope)) * (x_max - x_min)
-    if r2 < cfg.ground_line_min_r2 or total_rise < cfg.ground_line_min_total_rise_px:
-        return GroundLine(
-            0.0,
-            float(np.median(envelope_xy[:, 1])),
-            r2,
-            len(candidates),
-            len(envelope),
-            "horizontal_fallback",
-        )
-    return GroundLine(
-        float(slope),
-        float(intercept),
-        r2,
-        len(candidates),
-        len(envelope),
-        "robust_spatial_line",
-    )
-
-
-def fit_global_ground_line_from_assignments(
-    assignments: list[dromia_dto.ShoeAssignment], cfg: dromia_config.GaitAnalysisConfig
-) -> GroundLine:
-    """Fit the video-level floor without depending on a runner task's crop."""
-
-    candidates: list[ShoeFrame] = []
-    for item in assignments:
-        curve = lower_curve(item.mask) if item.mask is not None else np.empty((0, 2), np.float32)
-        if not len(curve):
-            continue
-        max_y = float(np.max(curve[:, 1]))
-        bottom = curve[curve[:, 1] >= max_y - 1.0]
-        candidates.append(
-            ShoeFrame(
-                frame_idx=int(item.frame_idx),
-                runner_id=int(item.runner_id),
-                side=item.side,
-                score=float(item.score),
-                curve=[],
-                max_y=max_y,
-                mask_observed=True,
-                ground_x=float(np.median(bottom[:, 0])),
-            )
-        )
-    return fit_global_ground_line(candidates, cfg)
 
 
 def assign_local_step_grounds(
@@ -1540,69 +1384,7 @@ def global_flight_intervals_from_rows(
     return intervals
 
 
-def write_gait_artifacts(
-    payload: dict[str, Any],
-    *,
-    run_dir: Path,
-    video_path: Path | None = None,
-    frame_indices: np.ndarray | None = None,
-    object_ids: np.ndarray | None = None,
-    pose_xy: np.ndarray | None = None,
-    shoe_assignments: list[dromia_dto.ShoeAssignment] | None = None,
-    fps: float | None = None,
-    draw_video: bool = True,
-    suffix: str = "",
-) -> dict[str, str]:
-    output = run_dir / "gait"
-    output.mkdir(parents=True, exist_ok=True)
-    json_path = output / f"gait_analysis{suffix}.json"
-    json_path.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
-    frame_rows = [row for runner in payload["runners"].values() for row in runner["frames"]]
-    event_rows = [row for runner in payload["runners"].values() for row in runner["events"]]
-    frames_csv = output / f"gait_frames{suffix}.csv"
-    events_csv = output / f"gait_events{suffix}.csv"
-    write_csv(frames_csv, frame_rows)
-    write_csv(
-        events_csv,
-        [
-            gait_contract.event_csv_row(
-                {
-                    **event,
-                    "source_fps": payload.get("source_fps"),
-                    "real_world_fps": payload.get("real_world_fps"),
-                }
-            )
-            for event in event_rows
-        ],
-    )
-    npz_path = output / f"gait_analysis{suffix}.npz"
-    write_npz(npz_path, frame_rows, event_rows)
-    artifacts = {
-        "gait_analysis_json": str(json_path.resolve()),
-        "gait_frames_csv": str(frames_csv.resolve()),
-        "gait_events_csv": str(events_csv.resolve()),
-        "gait_analysis_npz": str(npz_path.resolve()),
-    }
-    if (
-        draw_video
-        and video_path is not None
-        and frame_indices is not None
-        and object_ids is not None
-        and pose_xy is not None
-    ):
-        video_out = output / f"gait_debug{suffix}.mp4"
-        write_debug_video(
-            video_path,
-            video_out,
-            frame_indices,
-            object_ids,
-            pose_xy,
-            payload,
-            shoe_assignments or [],
-            fps or payload["fps"],
-        )
-        artifacts["gait_debug_video"] = str(video_out.resolve())
-    return artifacts
+write_gait_artifacts = gait_artifacts.write_gait_artifacts
 
 
 def analyze_run_pose(
@@ -1615,35 +1397,38 @@ def analyze_run_pose(
 
     run = run_dir.resolve()
     manifest = dromia_dto.RunManifest.model_validate_json((run / "manifest.json").read_text())
-    base = np.load(run / manifest.artifacts["pose_npz"])
-    pose_data = np.load(pose_path)
-    pose_key = next(
-        (
-            key
-            for key in (
-                "reviewed_keypoints_xy",
-                "first_pass_keypoints_xy",
-                "temporal_keypoints_xy",
-                "posterior_keypoints_xy",
-                "pose_xy",
-            )
-            if key in pose_data
-        ),
-        None,
-    )
-    if pose_key is None:
-        raise ValueError(
-            "Pose NPZ needs reviewed_keypoints_xy, first_pass_keypoints_xy, temporal_keypoints_xy, "
-            "posterior_keypoints_xy, or pose_xy"
+    with np.load(run / manifest.artifacts["pose_npz"], allow_pickle=False) as base:
+        base_frame_indices = np.asarray(base["frame_indices"], dtype=np.int32)
+        base_object_ids = np.asarray(base["object_ids"], dtype=np.int32)
+        base_bboxes = np.asarray(base["bboxes_xyxy"], dtype=np.float32)
+    with np.load(pose_path, allow_pickle=False) as pose_data:
+        pose_key = next(
+            (
+                key
+                for key in (
+                    "reviewed_keypoints_xy",
+                    "first_pass_keypoints_xy",
+                    "temporal_keypoints_xy",
+                    "posterior_keypoints_xy",
+                    "pose_xy",
+                )
+                if key in pose_data
+            ),
+            None,
         )
-    frames = np.asarray(pose_data.get("frame_indices", base["frame_indices"]), dtype=np.int32)
-    ids = np.asarray(pose_data.get("object_ids", base["object_ids"]), dtype=np.int32)
-    pose = np.asarray(pose_data[pose_key], dtype=np.float32)
-    base_frames = {int(value): idx for idx, value in enumerate(base["frame_indices"])}
-    base_ids = {int(value): idx for idx, value in enumerate(base["object_ids"])}
+        if pose_key is None:
+            raise ValueError(
+                "Pose NPZ needs reviewed_keypoints_xy, first_pass_keypoints_xy, "
+                "temporal_keypoints_xy, posterior_keypoints_xy, or pose_xy"
+            )
+        frames = np.asarray(pose_data.get("frame_indices", base_frame_indices), dtype=np.int32)
+        ids = np.asarray(pose_data.get("object_ids", base_object_ids), dtype=np.int32)
+        pose = np.asarray(pose_data[pose_key], dtype=np.float32)
+    base_frames = {int(value): idx for idx, value in enumerate(base_frame_indices)}
+    base_ids = {int(value): idx for idx, value in enumerate(base_object_ids)}
     frame_select = [base_frames[int(value)] for value in frames]
     id_select = [base_ids[int(value)] for value in ids]
-    bboxes = base["bboxes_xyxy"][np.ix_(frame_select, id_select)]
+    bboxes = base_bboxes[np.ix_(frame_select, id_select)]
     if runner_id is not None:
         matches = np.where(ids == runner_id)[0]
         if not len(matches):
@@ -1695,180 +1480,6 @@ def analyze_run_pose(
         draw_video=cfg.draw_debug_video,
         suffix=suffix,
     )
-
-
-def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    fields = list(dict.fromkeys(key for row in rows for key in row))
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        if fields:
-            writer.writeheader()
-            writer.writerows(rows)
-
-
-def write_npz(path: Path, frames: list[dict[str, Any]], events: list[dict[str, Any]]) -> None:
-    np.savez_compressed(
-        path,
-        frame_idx=np.asarray([x["frame_idx"] for x in frames], np.int32),
-        runner_id=np.asarray([x["runner_id"] for x in frames], np.int32),
-        # Float contact arrays preserve unknown observations as NaN (0=flight, 1=contact).
-        global_contact=numeric_array(frames, "global_contact"),
-        left_contact=numeric_array(frames, "left_contact"),
-        right_contact=numeric_array(frames, "right_contact"),
-        left_ground_y=numeric_array(frames, "left_ground_y"),
-        right_ground_y=numeric_array(frames, "right_ground_y"),
-        left_ground_step_index=numeric_array(frames, "left_ground_step_index"),
-        right_ground_step_index=numeric_array(frames, "right_ground_step_index"),
-        left_knee_angle_deg=numeric_array(frames, "left_knee_angle_deg"),
-        right_knee_angle_deg=numeric_array(frames, "right_knee_angle_deg"),
-        left_tibia_horizontal_angle_deg=numeric_array(frames, "left_tibia_horizontal_angle_deg"),
-        right_tibia_horizontal_angle_deg=numeric_array(frames, "right_tibia_horizontal_angle_deg"),
-        left_foot_tibia_angle_deg=numeric_array(frames, "left_foot_tibia_angle_deg"),
-        right_foot_tibia_angle_deg=numeric_array(frames, "right_foot_tibia_angle_deg"),
-        torso_lean_deg=numeric_array(frames, "torso_lean_deg"),
-        events_json=np.asarray(json.dumps(events)),
-    )
-
-
-def write_debug_video(
-    video_path: Path,
-    output_path: Path,
-    frame_indices: np.ndarray,
-    object_ids: np.ndarray,
-    pose: np.ndarray,
-    payload: dict[str, Any],
-    assignments: list[dromia_dto.ShoeAssignment],
-    fps: float,
-) -> None:
-    capture = cv2.VideoCapture(str(video_path))
-    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    writer = cv2.VideoWriter(
-        str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
-    )
-    masks = {(x.frame_idx, x.runner_id, x.side): x.mask for x in assignments if x.mask is not None}
-    rows = {
-        (int(rid), int(row["frame_idx"])): row
-        for rid, runner in ((int(k), v) for k, v in payload["runners"].items())
-        for row in runner["frames"]
-    }
-    events = {
-        (int(k), e["landing_frame"]): f"LANDING {e['side'][0].upper()} {e['strike_type']}"
-        for k, v in payload["runners"].items()
-        for e in v["events"]
-        if e["landing_frame"] is not None
-    }
-    ground_model = payload.get("ground_model", {})
-    ground_slope = (
-        ground_model.get("slope") if ground_model.get("model") == "global_spatial_line" else None
-    )
-    ground_intercept = (
-        ground_model.get("intercept")
-        if ground_model.get("model") == "global_spatial_line"
-        else None
-    )
-    for key, runner in payload["runners"].items():
-        for event in runner["events"]:
-            if event["takeoff_frame"] is not None:
-                events.setdefault((int(key), event["takeoff_frame"]), "TAKEOFF")
-            if event["knee_alignment_frame"] is not None:
-                alignment_key = (int(key), event["knee_alignment_frame"])
-                alignment_label = f"KNEE ALIGNMENT {event['side'][0].upper()}"
-                current = events.get(alignment_key)
-                events[alignment_key] = (
-                    alignment_label if current is None else f"{current} / {alignment_label}"
-                )
-    try:
-        for t, frame_idx_raw in enumerate(frame_indices):
-            capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx_raw))
-            ok, image = capture.read()
-            if not ok:
-                continue
-            frame_idx = int(frame_idx_raw)
-            if ground_slope is not None and ground_intercept is not None:
-                start_y = round(float(ground_intercept))
-                end_y = round(float(ground_slope) * (width - 1) + float(ground_intercept))
-                cv2.line(image, (0, start_y), (width - 1, end_y), (255, 255, 0), 3)
-            for o, rid_raw in enumerate(object_ids):
-                rid = int(rid_raw)
-                row = rows[(rid, frame_idx)]
-                if ground_slope is None or ground_intercept is None:
-                    runner_ground = payload["runners"][str(rid)]
-                    lines_by_side = runner_ground.get("ground_lines", {})
-                    ground_by_side = runner_ground["ground_y_by_side"]
-                    for side, color in (("left", (0, 220, 255)), ("right", (255, 160, 20))):
-                        line = lines_by_side.get(side, {})
-                        if line.get("slope") is not None and line.get("intercept") is not None:
-                            start_y = round(float(line["intercept"]))
-                            end_y = round(
-                                float(line["slope"]) * (width - 1) + float(line["intercept"])
-                            )
-                            cv2.line(image, (0, start_y), (width - 1, end_y), color, 2)
-                        else:
-                            ground = row.get(f"{side}_ground_y")
-                            if ground is None:
-                                ground = ground_by_side.get(side)
-                            if ground is None:
-                                continue
-                            cv2.line(
-                                image,
-                                (0, round(ground)),
-                                (width - 1, round(ground)),
-                                color,
-                                2,
-                            )
-                for side, color in (("left", (0, 220, 255)), ("right", (255, 160, 20))):
-                    mask = masks.get((frame_idx, rid, side))
-                    if mask is not None and mask.shape == image.shape[:2]:
-                        image[np.asarray(mask) > 0] = color
-                draw_pose_geometry(image, pose[t, o])
-                pose_x = (
-                    int(np.nanmin(pose[t, o, :, 0])) if np.isfinite(pose[t, o, :, 0]).any() else 10
-                )
-                x = min(max(pose_x, 5), max(width - 720, 5))
-                y = int(np.nanmin(pose[t, o, :, 1])) if np.isfinite(pose[t, o, :, 1]).any() else 30
-                label = (
-                    events.get((rid, frame_idx), "")
-                    if row.get("measurement_window_included", True)
-                    else "OUTSIDE CALIBRATION WINDOW"
-                )
-                lines = [
-                    f"runner {rid} {label}",
-                    format_side_overlay("L", "left", row),
-                    format_side_overlay("R", "right", row),
-                    f"torso={row['torso_posture']} {fmt(row['torso_lean_deg'])}",
-                ]
-                text_y = max(min(y - 12, height - 75), 18)
-                panel = image.copy()
-                cv2.rectangle(panel, (x - 5, text_y - 15), (width - 5, text_y + 65), (0, 0, 0), -1)
-                cv2.addWeighted(panel, 0.55, image, 0.45, 0, image)
-                for i, text in enumerate(lines):
-                    cv2.putText(
-                        image,
-                        text,
-                        (x, text_y + 20 * i),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
-            writer.write(image)
-    finally:
-        capture.release()
-        writer.release()
-
-
-def draw_pose_geometry(image: np.ndarray, p: np.ndarray) -> None:
-    for a, b in ((5, 11), (6, 12), (11, 13), (13, 15), (12, 14), (14, 16), (11, 12)):
-        if finite(p[a], p[b]):
-            cv2.line(
-                image,
-                tuple(np.rint(p[a]).astype(int)),
-                tuple(np.rint(p[b]).astype(int)),
-                (60, 255, 60),
-                2,
-            )
 
 
 def lower_curve(mask: np.ndarray | None, max_points: int = 80) -> np.ndarray:
@@ -2224,37 +1835,6 @@ def cadence_metrics(
         "window_start_frame": steps[0]["start_frame"] if steps else None,
         "window_end_frame": steps[-1]["end_frame"] if steps else None,
     }
-
-
-def migrate_metric_fields(value: Any) -> None:
-    """Remove retired schema families when recalibrating cached earlier artifacts."""
-    if isinstance(value, list):
-        for item in value:
-            migrate_metric_fields(item)
-    elif isinstance(value, dict):
-        for key in list(value):
-            item = value[key]
-            if (
-                any(
-                    name in key
-                    for name in (
-                        "foot_placement",
-                        "knee_flexion",
-                        "hip_leg",
-                        "midflight",
-                        "knee_alignment_is_approximate",
-                    )
-                )
-                or key == "mean_flight_time_s"
-            ):
-                value.pop(key)
-                continue
-            renamed = key.replace("tibia_floor_angle_deg", "tibia_horizontal_angle_deg")
-            if key in {"flight_time_s", "flight_time_ms", "flight_frames"}:
-                renamed = "same_foot_" + key
-            if renamed != key:
-                value[renamed] = value.pop(key)
-            migrate_metric_fields(item)
 
 
 def add_public_event_fields(event: dict[str, Any]) -> None:
@@ -2735,40 +2315,6 @@ def posture(lean: float | None, tolerance: float) -> str:
     return "front" if lean > tolerance else "back" if lean < -tolerance else "straight"
 
 
-def numeric_array(rows: list[dict[str, Any]], key: str) -> np.ndarray:
-    return np.asarray([np.nan if row.get(key) is None else row[key] for row in rows], np.float32)
-
-
-def fmt(value: Any) -> str:
-    return "--" if value is None else f"{float(value):.1f}deg"
-
-
-def format_side_overlay(label: str, side: str, row: dict[str, Any]) -> str:
-    return (
-        f"{label} c={row[f'{side}_contact']} "
-        f"k={fmt(row[f'{side}_knee_angle_deg'])} "
-        f"tf={fmt(row[f'{side}_tibia_horizontal_angle_deg'])} "
-    )
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Recompute gait metrics for an DromIA run")
-    parser.add_argument("run_dir", type=Path)
-    parser.add_argument("--pose-npz", type=Path)
-    args = parser.parse_args()
-    run = args.run_dir.resolve()
-    manifest = dromia_dto.RunManifest.model_validate_json((run / "manifest.json").read_text())
-    default_pose = manifest.artifacts.get("first_pass_pose_npz")
-    if default_pose is None:
-        default_pose = manifest.artifacts.get("temporal_biomechanics_npz")
-    if default_pose is None:
-        default_pose = manifest.artifacts["posterior_npz"]
-    pose_path = args.pose_npz or run / default_pose
-    artifacts = analyze_run_pose(run, pose_path)
-    print(json.dumps(artifacts, indent=2))
-    return 0
-
-
 def load_assignments_from_cache(
     run: Path, frames: np.ndarray, ids: np.ndarray
 ) -> list[dromia_dto.ShoeAssignment]:
@@ -2794,14 +2340,3 @@ def load_assignments_from_cache(
                     )
                 )
     return output
-
-
-def read_fps(path: Path) -> float:
-    cap = cv2.VideoCapture(str(path))
-    fps = float(cap.get(cv2.CAP_PROP_FPS))
-    cap.release()
-    return fps if fps > 0 else 30.0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
